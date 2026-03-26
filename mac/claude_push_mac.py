@@ -790,13 +790,15 @@ class ClaudePushApp(rumps.App):
         return "📱 Phone: not connected"
 
     def _update_phone_menu(self):
-        """Update the phone status menu item."""
-        try:
-            keys = list(self.menu.keys())
-            if len(keys) > 1:
-                self.menu[keys[1]].title = self._get_phone_status_label()
-        except Exception:
-            pass
+        """Update the phone status menu item (main-thread safe)."""
+        def _do():
+            try:
+                keys = list(self.menu.keys())
+                if len(keys) > 1:
+                    self.menu[keys[1]].title = self._get_phone_status_label()
+            except Exception:
+                pass
+        self._run_on_main(_do)
 
     def _manual_discover(self, _):
         """Manual discover triggered from menu."""
@@ -1127,17 +1129,31 @@ class ClaudePushApp(rumps.App):
 
         threading.Thread(target=do_send, daemon=True).start()
 
+    def _run_on_main(self, func):
+        """Schedule a function to run on the main thread via rumps.Timer.
+
+        This avoids AppKit thread-safety violations that deadlock the
+        menu bar and keyboard when UI is mutated from a background thread
+        (e.g. HTTP handler) while the dropdown menu is open.
+        """
+        def _fire(timer):
+            timer.stop()
+            func()
+        t = rumps.Timer(_fire, 0.1)
+        t.start()
+
     def on_file_received(self, path, is_text=False):
         if is_text:
             msg = f"Text copied to clipboard ({format_size(path.stat().st_size)})"
         else:
             msg = f"{path.name} ({format_size(path.stat().st_size)})"
-        self._notify("File received", msg)
-        self._refresh_files()
+        # All UI ops must run on main thread to avoid AppKit deadlock
+        self._run_on_main(lambda: self._notify("File received", msg))
+        self._run_on_main(self._refresh_files)
         self._flash_icon()
 
     def on_clipboard_received(self, preview):
-        self._notify("Clipboard updated", preview)
+        self._run_on_main(lambda: self._notify("Clipboard updated", preview))
         self._flash_icon()
 
     def _flash_icon(self):
