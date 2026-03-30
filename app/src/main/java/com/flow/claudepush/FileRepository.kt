@@ -19,13 +19,20 @@ data class ReceivedFile(
 class FileRepository(private val context: Context) {
     val dir: File = File(context.getExternalFilesDir(null), "received").also { it.mkdirs() }
     private val hiddenFile = File(dir, ".hidden")
+    private var hiddenCache: MutableSet<String>? = null
 
-    private fun loadHidden(): MutableSet<String> =
-        if (hiddenFile.exists()) hiddenFile.readLines().filter { it.isNotBlank() }.toMutableSet()
-        else mutableSetOf()
+    private fun loadHidden(): MutableSet<String> {
+        hiddenCache?.let { return it }
+        val set = if (hiddenFile.exists()) hiddenFile.readLines().filter { it.isNotBlank() }.toMutableSet()
+            else mutableSetOf()
+        hiddenCache = set
+        return set
+    }
 
-    private fun saveHidden(set: Set<String>) =
+    private fun saveHidden(set: Set<String>) {
         hiddenFile.writeText(set.joinToString("\n"))
+        hiddenCache = set.toMutableSet()
+    }
 
     fun list(): List<ReceivedFile> {
         val hidden = loadHidden()

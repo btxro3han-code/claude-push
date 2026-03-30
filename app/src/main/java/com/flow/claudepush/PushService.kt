@@ -124,7 +124,7 @@ class PushService : Service() {
                 updateNotification()
                 broadcastNetworkState()
                 // Delay rediscovery to let Mac also connect to new WiFi
-                handler.removeCallbacksAndMessages(null)
+                handler.removeMessages(MSG_REDISCOVER)
                 handler.postDelayed({
                     Log.i(TAG, "WiFi changed → rediscovering Mac")
                     nsd?.onNetworkChanged()
@@ -257,17 +257,7 @@ class PushService : Service() {
             .build()
     }
 
-    private fun getWifiName(): String? {
-        return try {
-            val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-            @Suppress("DEPRECATION")
-            val info = wifiManager.connectionInfo
-            val ssid = info?.ssid
-            if (ssid != null && ssid != "<unknown ssid>" && ssid != "0x") {
-                ssid.removeSurrounding("\"")
-            } else null
-        } catch (_: Exception) { null }
-    }
+    private fun getWifiName(): String? = getWifiName(applicationContext)
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
@@ -390,6 +380,19 @@ class PushService : Service() {
 
         /** Get the hotspot/tethering IP if active, or null. */
         fun getHotspotIp(): String? = enumerateIpv4().hotspotIp
+
+        /** Get WiFi SSID name, or null. */
+        fun getWifiName(context: android.content.Context): String? {
+            return try {
+                val wifiManager = context.applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                @Suppress("DEPRECATION")
+                val info = wifiManager.connectionInfo
+                val ssid = info?.ssid
+                if (ssid != null && ssid != "<unknown ssid>" && ssid != "0x") {
+                    ssid.removeSurrounding("\"")
+                } else null
+            } catch (_: Exception) { null }
+        }
 
         /**
          * Get WiFi IP using ConnectivityManager LinkProperties (requires context).

@@ -9,11 +9,14 @@ import atexit
 import concurrent.futures
 import http.server
 import json
+import logging
+import logging.handlers
 import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import urllib.request
@@ -22,6 +25,24 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 
 import time as _time
+
+# ── Logging setup (replaces all print → nohup.out) ──────────────
+_LOG_DIR = Path.home() / ".claude" / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_log_handler = logging.handlers.RotatingFileHandler(
+    _LOG_DIR / "claude_push_mac.log",
+    maxBytes=2 * 1024 * 1024,  # 2MB per file
+    backupCount=2,             # keep 2 old files, max 6MB total
+    encoding="utf-8",
+)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%m-%d %H:%M:%S"))
+_logger = logging.getLogger("claude_push")
+_logger.addHandler(_log_handler)
+_logger.setLevel(logging.INFO)
+# Silence stdout/stderr completely when running via nohup
+if not sys.stderr.isatty():
+    sys.stdout = open(os.devnull, "w")
+    sys.stderr = open(os.devnull, "w")
 
 import rumps
 
@@ -172,7 +193,7 @@ def _create_ouroboros_icon(flash=False):
         img.save(str(path))
         return str(path)
     except Exception as e:
-        print(f"[WARN] Could not create icon: {e}")
+        _logger.warning(f"Could not create icon: {e}")
         return None
 
 
@@ -185,7 +206,7 @@ def get_local_ip():
             addrs = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
             for a in addrs:
                 ip = a.get("addr")
-                if ip and not ip.startswith("127."):
+                if ip and not ip.startswith("127.") and not ip.startswith("198.18."):
                     return ip
     except ImportError:
         pass
@@ -196,7 +217,7 @@ def get_local_ip():
         for iface in ["en0", "en1"]:
             r = subprocess.run(["ifconfig", iface], capture_output=True, text=True, timeout=3)
             m = _re.search(r"inet (\d+\.\d+\.\d+\.\d+)", r.stdout)
-            if m and not m.group(1).startswith("127."):
+            if m and not m.group(1).startswith("127.") and not m.group(1).startswith("198.18."):
                 return m.group(1)
     except Exception:
         pass
@@ -270,18 +291,28 @@ def set_clipboard_text(text):
 def _lan_request(host, port, method, path, body=None, headers=None, timeout=5):
     """Make HTTP request bypassing macOS Network Extension.
     Uses curl subprocess since Cocoa app sockets get intercepted by proxy extensions."""
-    cmd = ["curl", "-s", "--connect-timeout", str(min(timeout, 10)),
+    cmd = ["curl", "-s", "--noproxy", "*", "--connect-timeout", str(min(timeout, 10)),
            "-m", str(timeout), "-X", method]
     if headers:
         for k, v in headers.items():
             cmd += ["-H", f"{k}: {v}"]
     if body:
         cmd += ["--data-binary", "@-"]
+    cmd += ["-w", "\n%{http_code}"]
     cmd.append(f"http://{host}:{port}{path}")
     r = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout + 5)
     if r.returncode != 0:
         raise OSError(f"curl failed: exit {r.returncode}, stderr={r.stderr[:200]}")
-    return 200, r.stdout
+    # Extract HTTP status code from curl -w output
+    output = r.stdout
+    last_nl = output.rfind(b"\n")
+    if last_nl >= 0:
+        status_code = int(output[last_nl + 1:].strip() or b"200")
+        body_data = output[:last_nl]
+    else:
+        status_code = 200
+        body_data = output
+    return status_code, body_data
 
 
 # ── Phone Discovery ──────────────────────────────────────────
@@ -291,7 +322,7 @@ def check_phone(host, port=PHONE_PORT, timeout=3):
     Uses curl to bypass macOS Network Extension interception."""
     try:
         r = subprocess.run(
-            ["curl", "-s", "--connect-timeout", str(min(timeout, 5)),
+            ["curl", "-s", "--noproxy", "*", "--connect-timeout", str(min(timeout, 5)),
              "-m", str(timeout), f"http://{host}:{port}/status"],
             capture_output=True, text=True, timeout=timeout + 3
         )
@@ -310,8 +341,7 @@ def scan_subnet_for_phone(my_ip, timeout=3):
     Phase 1: fast TCP probe to find open ports (0.5s timeout).
     Phase 2: HTTP check only on IPs with open port.
     Returns (ip, status_data) or None."""
-    import sys
-    _slog = lambda msg: print(f"[scan] {msg}", file=sys.stderr, flush=True)
+    _slog = lambda msg: _logger.info(f"[scan] {msg}")
     parts = my_ip.split(".")
     if len(parts) != 4:
         return None
@@ -396,14 +426,14 @@ def try_adb_forward():
 
         status = check_phone("127.0.0.1", ADB_FORWARD_PORT, timeout=2)
         if status:
-            print(f"[discovery] ADB USB connected: {status.get('device', 'unknown')}")
+            _logger.info(f"[discovery] ADB USB connected: {status.get('device', 'unknown')}")
             return status
         # Remove forward if phone app not running
         subprocess.run([adb, "forward", "--remove", f"tcp:{ADB_FORWARD_PORT}"],
                        capture_output=True, timeout=3)
         return None
     except Exception as e:
-        print(f"[discovery] ADB error: {e}")
+        _logger.warning(f"[discovery] ADB error: {e}")
         return None
 
 
@@ -534,56 +564,94 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
     def _recv_file(self):
         ct = self.headers.get("Content-Type", "")
         length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
+        max_size = 500 * 1024 * 1024  # 500MB
+        if length > max_size:
+            self._json(413, {"error": f"File too large ({length} bytes, max {max_size})"})
+            return
         params = parse_qs(urlparse(self.path).query)
         filename = params.get("filename", [None])[0]
 
-        if "multipart/form-data" in ct:
-            boundary = None
-            for seg in ct.split(";"):
-                seg = seg.strip()
-                if seg.startswith("boundary="):
-                    boundary = seg[9:].strip('"')
-            if not boundary:
-                self._json(400, {"error": "no boundary"})
-                return
+        # Stream body to a temp file in chunks to avoid OOM on large files
+        CHUNK = 256 * 1024  # 256KB
+        RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = RECEIVE_DIR / f".recv_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{id(self)}.tmp"
+        try:
+            remaining = length
+            with open(tmp_path, "wb") as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(CHUNK, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
 
-            sep = f"--{boundary}".encode()
-            for part in body.split(sep)[1:]:
-                if part.startswith(b"--"):
-                    break
-                if part.startswith(b"\r\n"):
-                    part = part[2:]
-                if b"\r\n\r\n" not in part:
-                    continue
-                hdr, data = part.split(b"\r\n\r\n", 1)
-                if data.endswith(b"\r\n"):
-                    data = data[:-2]
-
-                if not filename:
-                    for line in hdr.decode("utf-8", errors="replace").splitlines():
-                        if "filename=" in line:
-                            for s in line.split(";"):
-                                s = s.strip()
-                                if s.startswith("filename="):
-                                    filename = s.split("=", 1)[1].strip('"')
+            if "multipart/form-data" in ct:
+                self._parse_multipart_from_file(tmp_path, ct, filename)
+            else:
                 if not filename:
                     filename = f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-                path = save_file(filename, data)
-                self._json(200, {"ok": True, "file": path.name, "size": len(data)})
+                final_path = RECEIVE_DIR / filename
+                if final_path.exists():
+                    stem, ext = final_path.stem, final_path.suffix
+                    final_path = RECEIVE_DIR / f"{stem}_{datetime.now().strftime('%H%M%S')}{ext}"
+                tmp_path.rename(final_path)
+                size = final_path.stat().st_size
+                self._json(200, {"ok": True, "file": final_path.name, "size": size})
                 if self.app_ref:
-                    self.app_ref.on_file_received(path)
-                return
+                    self.app_ref.on_file_received(final_path)
+        except Exception as e:
+            _logger.exception("Error receiving file")
+            self._json(500, {"error": str(e)})
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
-            self._json(400, {"error": "no file in multipart"})
-        else:
+    def _parse_multipart_from_file(self, tmp_path, ct, filename):
+        """Parse multipart from a temp file, extracting the file part without loading all into memory."""
+        boundary = None
+        for seg in ct.split(";"):
+            seg = seg.strip()
+            if seg.startswith("boundary="):
+                boundary = seg[9:].strip('"')
+        if not boundary:
+            self._json(400, {"error": "no boundary"})
+            return
+
+        sep = f"--{boundary}".encode()
+        end_sep = f"--{boundary}--".encode()
+
+        with open(tmp_path, "rb") as f:
+            raw = f.read()
+
+        parts = raw.split(sep)
+        for part in parts[1:]:
+            if part.startswith(b"--") or part.strip() == b"--":
+                break
+            if part.startswith(b"\r\n"):
+                part = part[2:]
+            if b"\r\n\r\n" not in part:
+                continue
+            hdr, data = part.split(b"\r\n\r\n", 1)
+            if data.endswith(b"\r\n"):
+                data = data[:-2]
+
+            if not filename:
+                for line in hdr.decode("utf-8", errors="replace").splitlines():
+                    if "filename=" in line:
+                        for s in line.split(";"):
+                            s = s.strip()
+                            if s.startswith("filename="):
+                                filename = s.split("=", 1)[1].strip('"')
             if not filename:
                 filename = f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            path = save_file(filename, body)
-            self._json(200, {"ok": True, "file": path.name, "size": len(body)})
+
+            path = save_file(filename, data)
+            self._json(200, {"ok": True, "file": path.name, "size": len(data)})
             if self.app_ref:
                 self.app_ref.on_file_received(path)
+            return
+
+        self._json(400, {"error": "no file in multipart"})
 
 
 # ── Drop Zone Window ────────────────────────────────────────
@@ -640,7 +708,7 @@ if _HAS_APPKIT:
                 text.drawAtPoint_withAttributes_(
                     NSMakePoint((w - sz.width) / 2, (h - sz.height) / 2), attrs)
             except Exception as e:
-                print(f"[DropView] drawRect_ error: {e}")
+                _logger.warning(f"[DropView] drawRect_ error: {e}")
 
         def draggingEntered_(self, sender):
             _drop_dragging[id(self)] = True
@@ -730,7 +798,7 @@ class ClaudePushApp(rumps.App):
             t = threading.Thread(target=self.server.serve_forever, daemon=True)
             t.start()
         except OSError:
-            print(f"[ERROR] Port {PORT} already in use")
+            _logger.error(f"Port {PORT} already in use")
 
     def _start_mdns(self):
         try:
@@ -790,15 +858,20 @@ class ClaudePushApp(rumps.App):
         return "📱 Phone: not connected"
 
     def _update_phone_menu(self):
-        """Update the phone status menu item (main-thread safe)."""
-        def _do():
-            try:
-                keys = list(self.menu.keys())
-                if len(keys) > 1:
-                    self.menu[keys[1]].title = self._get_phone_status_label()
-            except Exception:
-                pass
-        self._run_on_main(_do)
+        """Update the phone status menu item."""
+        try:
+            new_label = self._get_phone_status_label()
+            for key in list(self.menu.keys()):
+                item = self.menu[key]
+                if hasattr(item, 'title') and "Phone" in item.title:
+                    # rumps uses the original title as key, so we need to
+                    # remove and re-add if the key changed
+                    if key != new_label:
+                        del self.menu[key]
+                        self.menu.insert_after(list(self.menu.keys())[0], rumps.MenuItem(new_label, callback=None))
+                    return
+        except Exception as e:
+            _logger.error(f"[menu] update failed: {e}")
 
     def _manual_discover(self, _):
         """Manual discover triggered from menu."""
@@ -809,12 +882,11 @@ class ClaudePushApp(rumps.App):
         if not self._discover_lock.acquire(blocking=False):
             return
         try:
-            import sys
             found = False
 
             # 1. Try saved IP first (fast path)
             saved = get_phone_target()
-            _log = lambda msg: print(f"[discovery] {msg}", file=sys.stderr, flush=True)
+            _log = lambda msg: _logger.info(f"[discovery] {msg}")
             _log(f"start (saved={saved}, my_ip={get_local_ip()})")
 
 
@@ -824,7 +896,7 @@ class ClaudePushApp(rumps.App):
                 status = check_phone(host, port, timeout=2)
                 if status:
                     self.save_phone_ip(host, status)
-                    print(f"[discovery] Phone verified at saved IP: {host}")
+                    _logger.info(f"[discovery] Phone verified at saved IP: {host}")
                     found = True
 
             # 2. Try ADB USB (works without any network)
@@ -835,7 +907,7 @@ class ClaudePushApp(rumps.App):
                 if status:
                     self.phone_via_adb = True
                     self.save_phone_ip("127.0.0.1", status)
-                    print(f"[discovery] Phone connected via USB: {status.get('device', '?')}")
+                    _logger.info(f"[discovery] Phone connected via USB: {status.get('device', '?')}")
                     found = True
                     if notify:
                         self._notify("Phone found", f"USB: {status.get('device', 'unknown')}")
@@ -849,17 +921,17 @@ class ClaudePushApp(rumps.App):
                     if result:
                         ip, status = result
                         self.save_phone_ip(ip, status)
-                        print(f"[discovery] Phone found via scan: {ip} ({status.get('device', '?')})")
+                        _logger.info(f"[discovery] Phone found via scan: {ip} ({status.get('device', '?')})")
                         found = True
                         if notify:
                             self._notify("Phone found", f"WiFi: {ip} ({status.get('device', 'unknown')})")
 
             if not found:
-                print("[discovery] Phone not found")
+                _logger.info("[discovery] Phone not found")
                 if notify:
                     self._notify("Phone not found", "Make sure Claude Push is open on your phone")
         except Exception as e:
-            print(f"[discovery] Error: {e}")
+            _logger.error(f"[discovery] Error: {e}")
         finally:
             self._discover_lock.release()
 
@@ -868,16 +940,17 @@ class ClaudePushApp(rumps.App):
         self._refresh_files()
         new_ip = get_local_ip()
         if new_ip != self.ip:
+            # Ignore sing-box/proxy virtual IPs (198.18.x.x) — not a real network change
+            if new_ip.startswith("198.18.") or self.ip.startswith("198.18."):
+                return
             old_ip = self.ip
             self.ip = new_ip
             status_key = list(self.menu.keys())[0]
             self.menu[status_key].title = f"📡 {self.ip}:{PORT}"
-            # Network changed — always clear stale phone state (BUG #3 fix)
-            print(f"[discovery] IP changed {old_ip} → {new_ip}")
+            _logger.info(f"[discovery] IP changed {old_ip} → {new_ip}")
             self.phone_ip = None
             self.phone_via_adb = False
             self._update_phone_menu()
-            # Rediscover if we have a real network
             if new_ip != "127.0.0.1":
                 threading.Thread(target=self._discover_phone, daemon=True).start()
 
@@ -888,17 +961,20 @@ class ClaudePushApp(rumps.App):
             if self.phone_ip:
                 # Verify phone still reachable
                 port = ADB_FORWARD_PORT if self.phone_via_adb else PHONE_PORT
-                status = check_phone(self.phone_ip, port, timeout=2)
+                status = check_phone(self.phone_ip, port, timeout=3)
                 if status:
+                    self._fail_count = 0
+                    self._update_phone_menu()
                     return  # Still connected
-                # Phone lost — clear stale state (BUG #5 fix)
-                print(f"[discovery] Phone {self.phone_ip} unreachable, rediscovering...")
+                # Tolerate transient failures — only disconnect after 3 consecutive misses
+                self._fail_count = getattr(self, '_fail_count', 0) + 1
+                _logger.info(f"[discovery] Phone {self.phone_ip} check failed ({self._fail_count}/3)")
+                if self._fail_count < 3:
+                    return  # Give it another chance
+                _logger.info(f"[discovery] Phone {self.phone_ip} unreachable after 3 checks, rediscovering...")
+                self._fail_count = 0
                 self.phone_ip = None
                 self.phone_via_adb = False
-                try:
-                    PHONE_CONFIG.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 self._update_phone_menu()
             # No phone known — try to find one
             self._discover_phone()
@@ -919,7 +995,7 @@ class ClaudePushApp(rumps.App):
             with urllib.request.urlopen(req, timeout=15) as resp:
                 items = json.loads(resp.read()).get("files", [])
         except Exception as e:
-            print(f"[dev_poller] 拉取失败: {e}")
+            _logger.warning(f"[dev_poller] 拉取失败: {e}")
             return
         finally:
             self._dev_polling = False
@@ -954,12 +1030,12 @@ class ClaudePushApp(rumps.App):
                 )
                 urllib.request.urlopen(mark, timeout=10)
             except Exception as e:
-                print(f"[dev_poller] 标记失败 {filename}: {e}")
+                _logger.warning(f"[dev_poller] 标记失败 {filename}: {e}")
 
         # 只复制最后一条到剪贴板
         if last_text:
             set_clipboard_text(last_text)
-            print(f"[dev_poller] 拉取 {len(items)} 条开发想法")
+            _logger.info(f"[dev_poller] 拉取 {len(items)} 条开发想法")
 
     def _refresh_files(self):
         try:
@@ -1006,27 +1082,21 @@ class ClaudePushApp(rumps.App):
 
         def do_push():
             try:
-                boundary = f"----ClaudePush{int(_time.time() * 1000)}"
                 filename = path.name
-                file_data = path.read_bytes()
-
-                body = (
-                    f"--{boundary}\r\n"
-                    f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-                    f"Content-Type: application/octet-stream\r\n"
-                    f"\r\n"
-                ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
-
+                file_size = path.stat().st_size
                 host, _, port_s = target.partition(":")
                 port = int(port_s) if port_s else PHONE_PORT
-                status, resp_body = _lan_request(
-                    host, port, "POST", f"/push?filename={quote(filename)}",
-                    body=body,
-                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                    timeout=60,
-                )
-                json.loads(resp_body)
-                self._notify("Sent to phone", f"{filename} ({format_size(len(file_data))})")
+                # Use curl with file reference to avoid loading into memory
+                cmd = [
+                    "curl", "-s", "--noproxy", "*", "--connect-timeout", "10", "-m", "300",
+                    "-X", "POST",
+                    "-F", f'file=@{path};filename={filename}',
+                    f"http://{host}:{port}/push?filename={quote(filename)}"
+                ]
+                r = subprocess.run(cmd, capture_output=True, timeout=310)
+                if r.returncode != 0:
+                    raise OSError(f"curl failed: exit {r.returncode}")
+                self._notify("Sent to phone", f"{filename} ({format_size(file_size)})")
                 self._flash_icon()
             except Exception as e:
                 self._notify("Send failed", str(e)[:80])
@@ -1163,6 +1233,12 @@ class ClaudePushApp(rumps.App):
         avoiding AppKit thread-safety violations that can deadlock
         the entire macOS event dispatch (freezing keyboard/mouse).
         """
+        # Stop any previous flash timer to prevent accumulation
+        if hasattr(self, '_flash_timer') and self._flash_timer:
+            try:
+                self._flash_timer.stop()
+            except Exception:
+                pass
         self._flash_step = 0
         self._flash_frames = ["✨", "🔥", "✨", ""]
         def _flash_tick(timer):
@@ -1175,7 +1251,9 @@ class ClaudePushApp(rumps.App):
                 if self._icon_path:
                     self.icon = self._icon_path
                 timer.stop()
+                self._flash_timer = None
         t = rumps.Timer(_flash_tick, 0.3)
+        self._flash_timer = t
         t.start()
 
     def _notify(self, title, msg):

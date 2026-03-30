@@ -8,6 +8,7 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val PORT = 18080
 
@@ -20,6 +21,7 @@ class PushServer(
 
     @Volatile
     private var lastDetectedMacIp: String? = null
+    private val detecting = AtomicBoolean(false)
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
@@ -49,6 +51,8 @@ class PushServer(
 
     /** Check if the sender is a Mac running our receiver */
     private fun detectMac(ip: String) {
+        // Rate-limit: only one detection probe at a time
+        if (!detecting.compareAndSet(false, true)) return
         Thread {
             try {
                 val port = NsdHelper.MAC_PORT
@@ -64,7 +68,10 @@ class PushServer(
                     Log.i("PushServer", "Mac auto-detected from push: $ip:$port")
                     onMacDetected?.invoke(ip, port)
                 }
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+            } finally {
+                detecting.set(false)
+            }
         }.start()
     }
 
@@ -138,9 +145,10 @@ class PushServer(
         )
     }
 
-    private fun readBody(session: IHTTPSession): String {
+    private fun readBody(session: IHTTPSession, maxSize: Int = 1024 * 1024): String {
         val size = (session.headers["content-length"] ?: "0").toIntOrNull() ?: 0
         if (size <= 0) return ""
+        if (size > maxSize) return ""
         val buf = ByteArray(size)
         var read = 0
         while (read < size) {

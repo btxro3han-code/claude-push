@@ -39,18 +39,26 @@ object MacUploader {
                 conn.doOutput = true
                 conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
                 conn.connectTimeout = 5000
-                conn.readTimeout = 300_000 // 5 min for large files
+                conn.readTimeout = 600_000 // 10 min for large files
+
+                // Calculate total content length to use fixed-length streaming
+                // This avoids buffering the entire file in memory (OOM on 300MB+)
+                // and avoids chunked TE which Python's HTTPServer handles poorly
+                val headerBytes = ("--$boundary\r\n" +
+                    "Content-Disposition: form-data; name=\"file\"; filename=\"$filename\"\r\n" +
+                    "Content-Type: application/octet-stream\r\n\r\n").toByteArray()
+                val tailBytes = "\r\n--$boundary--\r\n".toByteArray()
+                val fileSize = getFileSize(context, uri)
+                val totalLength = headerBytes.size.toLong() + fileSize + tailBytes.size.toLong()
+                conn.setFixedLengthStreamingMode(totalLength)
 
                 val input = context.contentResolver.openInputStream(uri)
                     ?: throw Exception("Cannot open file")
 
-                conn.outputStream.buffered().use { out ->
-                    val header = "--$boundary\r\n" +
-                        "Content-Disposition: form-data; name=\"file\"; filename=\"$filename\"\r\n" +
-                        "Content-Type: application/octet-stream\r\n\r\n"
-                    out.write(header.toByteArray())
-                    input.use { it.copyTo(out) }
-                    out.write("\r\n--$boundary--\r\n".toByteArray())
+                conn.outputStream.buffered(256 * 1024).use { out ->
+                    out.write(headerBytes)
+                    input.use { it.copyTo(out, bufferSize = 256 * 1024) }
+                    out.write(tailBytes)
                     out.flush()
                 }
 
@@ -66,6 +74,24 @@ object MacUploader {
                 onResult(false, e.message ?: "Upload failed")
             }
         }.start()
+    }
+
+    private fun getFileSize(context: Context, uri: Uri): Long {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (idx >= 0 && !cursor.isNull(idx)) return cursor.getLong(idx)
+            }
+        }
+        // Fallback: read through to count (rare)
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            var size = 0L
+            val buf = ByteArray(8192)
+            var n: Int
+            while (stream.read(buf).also { n = it } != -1) size += n
+            return size
+        }
+        throw Exception("Cannot determine file size")
     }
 
     private fun getFileName(context: Context, uri: Uri): String {

@@ -36,9 +36,9 @@ cat > "$PLIST" << PLIST
         <false/>
     </dict>
     <key>StandardErrorPath</key>
-    <string>/tmp/claude-push-mac.err</string>
+    <string>/dev/null</string>
     <key>StandardOutPath</key>
-    <string>/tmp/claude-push-mac.log</string>
+    <string>/dev/null</string>
 </dict>
 </plist>
 PLIST

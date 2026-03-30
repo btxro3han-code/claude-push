@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,23 +35,71 @@ fun FileListScreen(
     onToggleServer: () -> Unit,
     onFileClick: (ReceivedFile) -> Unit,
     onDeleteFile: (ReceivedFile) -> Unit,
+    onDeleteFiles: (List<ReceivedFile>) -> Unit,
     onHideFile: (ReceivedFile) -> Unit,
     onSendToMac: () -> Unit,
     onSendClipboard: () -> Unit,
     onSendScreenshot: () -> Unit,
 ) {
+    var selectMode by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(setOf<String>()) }
+
+    // Exit select mode when files change
+    LaunchedEffect(files) {
+        if (selectMode && selected.none { name -> files.any { it.name == name } }) {
+            selectMode = false
+            selected = emptySet()
+        }
+    }
+
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Claude Push") },
-                actions = {
-                    if (isRunning) {
-                        Badge(containerColor = MaterialTheme.colorScheme.primary) {
-                            Text(" ON ", color = MaterialTheme.colorScheme.onPrimary)
+            if (selectMode) {
+                TopAppBar(
+                    title = { Text("已选 ${selected.size} 项") },
+                    navigationIcon = {
+                        IconButton(onClick = { selectMode = false; selected = emptySet() }) {
+                            Text("✕", style = MaterialTheme.typography.titleMedium)
+                        }
+                    },
+                    actions = {
+                        TextButton(onClick = {
+                            selected = if (selected.size == files.size)
+                                emptySet()
+                            else
+                                files.map { it.name }.toSet()
+                        }) {
+                            Text(if (selected.size == files.size) "取消全选" else "全选")
+                        }
+                        TextButton(
+                            onClick = {
+                                val toDelete = files.filter { it.name in selected }
+                                onDeleteFiles(toDelete)
+                                selectMode = false
+                                selected = emptySet()
+                            },
+                            enabled = selected.isNotEmpty()
+                        ) {
+                            Text("删除", color = if (selected.isNotEmpty())
+                                MaterialTheme.colorScheme.error
+                            else
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
-                }
-            )
+                )
+            } else {
+                TopAppBar(
+                    title = { Text("Claude Push") },
+                    actions = {
+                        if (isRunning) {
+                            Badge(containerColor = MaterialTheme.colorScheme.primary) {
+                                Text(" ON ", color = MaterialTheme.colorScheme.onPrimary)
+                            }
+                        }
+                    }
+                )
+            }
         },
         floatingActionButton = {
             Column(
@@ -186,7 +235,24 @@ fun FileListScreen(
                     items(files, key = { it.name }) { file ->
                         FileRow(
                             file = file,
-                            onClick = { onFileClick(file) },
+                            selectMode = selectMode,
+                            isSelected = file.name in selected,
+                            onClick = {
+                                if (selectMode) {
+                                    selected = if (file.name in selected)
+                                        selected - file.name
+                                    else
+                                        selected + file.name
+                                } else {
+                                    onFileClick(file)
+                                }
+                            },
+                            onLongClick = {
+                                if (!selectMode) {
+                                    selectMode = true
+                                    selected = setOf(file.name)
+                                }
+                            },
                             onDelete = { onDeleteFile(file) },
                             onHide = { onHideFile(file) }
                         )
@@ -201,7 +267,10 @@ fun FileListScreen(
 @Composable
 private fun FileRow(
     file: ReceivedFile,
+    selectMode: Boolean,
+    isSelected: Boolean,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
     onDelete: () -> Unit,
     onHide: () -> Unit
 ) {
@@ -219,7 +288,10 @@ private fun FileRow(
         ListItem(
             modifier = Modifier.combinedClickable(
                 onClick = onClick,
-                onLongClick = { showMenu = true }
+                onLongClick = {
+                    if (!selectMode) onLongClick()
+                    else showMenu = true
+                }
             ),
             headlineContent = {
                 Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -228,34 +300,45 @@ private fun FileRow(
                 Text("${formatSize(file.size)}  |  ${sdf.format(Date(file.timestamp))}")
             },
             leadingContent = {
-                Text(icon, style = MaterialTheme.typography.headlineMedium)
+                if (selectMode) {
+                    Checkbox(
+                        checked = isSelected,
+                        onCheckedChange = { onClick() }
+                    )
+                } else {
+                    Text(icon, style = MaterialTheme.typography.headlineMedium)
+                }
             },
             trailingContent = {
-                Row {
-                    if (file.type == "apk") {
-                        FilledTonalButton(onClick = onClick) {
-                            Text("Install")
+                if (!selectMode) {
+                    Row {
+                        if (file.type == "apk") {
+                            FilledTonalButton(onClick = onClick) {
+                                Text("Install")
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
                         }
-                        Spacer(modifier = Modifier.width(4.dp))
-                    }
-                    IconButton(onClick = { showMenu = true }) {
-                        Text("\u2716")
+                        IconButton(onClick = { showMenu = true }) {
+                            Text("\u2716")
+                        }
                     }
                 }
             }
         )
-        DropdownMenu(
-            expanded = showMenu,
-            onDismissRequest = { showMenu = false }
-        ) {
-            DropdownMenuItem(
-                text = { Text("从列表移除") },
-                onClick = { showMenu = false; onHide() }
-            )
-            DropdownMenuItem(
-                text = { Text("删除文件") },
-                onClick = { showMenu = false; onDelete() }
-            )
+        if (!selectMode) {
+            DropdownMenu(
+                expanded = showMenu,
+                onDismissRequest = { showMenu = false }
+            ) {
+                DropdownMenuItem(
+                    text = { Text("从列表移除") },
+                    onClick = { showMenu = false; onHide() }
+                )
+                DropdownMenuItem(
+                    text = { Text("删除文件") },
+                    onClick = { showMenu = false; onDelete() }
+                )
+            }
         }
     }
     HorizontalDivider()

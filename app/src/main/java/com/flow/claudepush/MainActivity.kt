@@ -6,9 +6,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
-import android.net.wifi.WifiManager
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -16,9 +13,9 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import android.provider.MediaStore
 import android.provider.Settings
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -247,6 +244,10 @@ class MainActivity : ComponentActivity() {
                     repo.delete(rf.name)
                     refreshTrigger.intValue++
                 },
+                onDeleteFiles = { list ->
+                    list.forEach { repo.delete(it.name) }
+                    refreshTrigger.intValue++
+                },
                 onHideFile = { rf ->
                     repo.hide(rf.name)
                     refreshTrigger.intValue++
@@ -262,17 +263,7 @@ class MainActivity : ComponentActivity() {
 
     // ── WiFi Info ─────────────────────────────────────────────
 
-    private fun getWifiName(): String? {
-        return try {
-            val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-            @Suppress("DEPRECATION")
-            val info = wifiManager.connectionInfo
-            val ssid = info?.ssid
-            if (ssid != null && ssid != "<unknown ssid>" && ssid != "0x") {
-                ssid.removeSurrounding("\"")
-            } else null
-        } catch (_: Exception) { null }
-    }
+    private fun getWifiName(): String? = PushService.getWifiName(this)
 
     // ── Mac host resolution ──────────────────────────────────
 
@@ -298,16 +289,7 @@ class MainActivity : ComponentActivity() {
 
     // ── Upload to Mac ───────────────────────────────────────
 
-    private fun uploadToMac(uri: Uri) {
-        val host = getMacHost()
-        val port = getMacPort()
-
-        Log.i("MainActivity", "uploadToMac: host=$host port=$port")
-
-        if (host == null) {
-            Toast.makeText(this, MAC_NOT_FOUND_MSG, Toast.LENGTH_LONG).show()
-            return
-        }
+    private fun uploadToMac(uri: Uri) = withMac { host, port ->
         Toast.makeText(this, "正在发送到 $host:$port ...", Toast.LENGTH_SHORT).show()
         MacUploader.upload(this, uri, host, port) { ok, msg ->
             runOnUiThread {
