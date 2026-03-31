@@ -36,7 +36,8 @@ class PushService : Service() {
         server = PushServer(repo!!, onFileReceived = {
             notifyFileChange()
         }, onMacDetected = { host, port ->
-            nsd?.saveMacHost(host, port)
+            // announce=false: Mac told us about itself, don't echo back
+            nsd?.saveMacHost(host, port, announce = false)
         }, onClipboardReceived = { text ->
             setClipboard(text)
         })
@@ -59,9 +60,7 @@ class PushService : Service() {
                 Log.i(TAG, "Push server started on $ip:$SERVER_PORT")
             }
             nsd?.register(SERVER_PORT)
-            // Don't discoverMac() here — onAvailable callback will trigger it
-            // after a 3s delay, avoiding double-scan on startup (BUG #1 fix)
-            startPeriodicRecheck()
+            // Mac discovers phone and announces itself — no phone-side scanning needed
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start server", e)
             stopSelf()
@@ -70,31 +69,8 @@ class PushService : Service() {
         return START_STICKY
     }
 
-    /**
-     * Periodic Mac recheck (every 60s). Handles cases where:
-     * - Mac changed IP silently (DHCP renewal)
-     * - Phone started hotspot and Mac connected (no WiFi callback fires)
-     * - Mac rebooted
-     */
-    private fun startPeriodicRecheck() {
-        handler.removeMessages(MSG_RECHECK)
-        handler.postDelayed(object : Runnable {
-            override fun run() {
-                nsd?.let { nsd ->
-                    val host = nsd.macHost
-                    if (host != null && !nsd.isMacReachable()) {
-                        Log.i(TAG, "Mac $host unreachable, rediscovering...")
-                        nsd.onNetworkChanged()
-                        nsd.discoverMac()
-                    } else if (host == null) {
-                        Log.i(TAG, "No Mac known, periodic discovery...")
-                        nsd.discoverMac()
-                    }
-                }
-                handler.postDelayed(this, RECHECK_INTERVAL_MS)
-            }
-        }, RECHECK_INTERVAL_MS)
-    }
+    // No periodic recheck needed — Mac announces itself every 30s via _phone_checker.
+    // Phone trusts announce and only clears macHost on WiFi network change.
 
     override fun onDestroy() {
         unregisterWifiCallback()
@@ -119,25 +95,19 @@ class PushService : Service() {
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.i(TAG, "WiFi network available: $network")
+                val isRealChange = _wifiNetwork != null && _wifiNetwork != network
+                Log.i(TAG, "WiFi network available: $network (realChange=$isRealChange)")
                 _wifiNetwork = network
                 updateNotification()
                 broadcastNetworkState()
-                // Delay rediscovery to let Mac also connect to new WiFi
-                handler.removeMessages(MSG_REDISCOVER)
-                handler.postDelayed({
-                    Log.i(TAG, "WiFi changed → rediscovering Mac")
+                if (isRealChange) {
+                    // WiFi actually changed — clear old Mac, wait for Mac to announce
                     nsd?.onNetworkChanged()
                     nsd?.register(SERVER_PORT)
-                    nsd?.discoverMac()
-                    // Retry once more after 30s if Mac not found (Mac may be slower to connect)
-                    handler.postDelayed({
-                        if (nsd?.macHost == null || !nsd!!.isMacReachable()) {
-                            Log.i(TAG, "Mac not found after WiFi change, retrying...")
-                            nsd?.discoverMac()
-                        }
-                    }, 30_000L)
-                }, 3_000L)
+                    Log.i(TAG, "WiFi changed → cleared Mac, waiting for announce")
+                } else {
+                    nsd?.register(SERVER_PORT)
+                }
             }
 
             override fun onLost(network: Network) {
@@ -149,14 +119,7 @@ class PushService : Service() {
                 nsd?.onNetworkChanged()
                 updateNotification()
                 broadcastNetworkState()
-                // WiFi lost, but hotspot might be active — try discover via hotspot subnet
-                if (getHotspotIp() != null) {
-                    handler.postDelayed({
-                        Log.i(TAG, "WiFi lost but hotspot active, scanning for Mac...")
-                        nsd?.register(SERVER_PORT)
-                        nsd?.discoverMac()
-                    }, 3_000L)
-                }
+                // WiFi lost — Mac will find us and announce when ready
             }
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
@@ -305,8 +268,6 @@ class PushService : Service() {
         const val ACTION_NETWORK_CHANGED = "com.flow.claudepush.NETWORK_CHANGED"
         const val SERVER_PORT = 18080
         private const val MSG_REDISCOVER = 1001
-        private const val MSG_RECHECK = 1002
-        private const val RECHECK_INTERVAL_MS = 60_000L
 
         private var _nsdRef: NsdHelper? = null
 
@@ -319,8 +280,8 @@ class PushService : Service() {
         val macHost: String? get() = _nsdRef?.macHost
         val macPort: Int get() = _nsdRef?.macPort ?: NsdHelper.MAC_PORT
 
-        fun recheckMac() {
-            _nsdRef?.recheckMac()
+        fun restoreMac() {
+            _nsdRef?.restoreFromPrefs()
         }
 
         /** Get the WiFi Network object for binding HTTP connections. */

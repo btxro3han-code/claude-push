@@ -160,7 +160,7 @@ class MainActivity : ComponentActivity() {
         }
         refreshTrigger.value++
         // Re-check Mac connection when coming back to app
-        Thread { PushService.recheckMac() }.start()
+        PushService.restoreMac()
     }
 
     override fun onPause() {
@@ -176,7 +176,7 @@ class MainActivity : ComponentActivity() {
         val files = remember(trigger) { repo.list() }
         val ip = remember(netTrigger) { PushService.getWifiIp(this@MainActivity) }
         val wifiName = remember(netTrigger) { getWifiName() }
-        val hasWifi = remember(netTrigger) { PushService.getWifiNetwork() != null }
+        val hasWifi = remember(netTrigger) { PushService.getWifiNetwork() != null || PushService.getHotspotIp() != null }
         var isRunning by remember { mutableStateOf(true) }
         var viewingFile by remember { mutableStateOf<Pair<File, String>?>(null) }
 
@@ -323,12 +323,7 @@ class MainActivity : ComponentActivity() {
             try {
                 val json = JSONObject().put("text", text)
                 val url = URL("http://$host:$port/clipboard")
-                val wifiNetwork = PushService.getWifiNetwork()
-                val conn = if (wifiNetwork != null) {
-                    wifiNetwork.openConnection(url) as HttpURLConnection
-                } else {
-                    url.openConnection() as HttpURLConnection
-                }
+                val conn = url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.doOutput = true
                 conn.setRequestProperty("Content-Type", "application/json")

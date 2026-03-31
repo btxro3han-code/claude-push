@@ -42,6 +42,10 @@ class PushServer(
                 method == Method.POST && uri == "/push/text" -> servePushText(session)
                 method == Method.POST && uri == "/clipboard" -> serveSetClipboard(session)
                 method == Method.GET && uri == "/clipboard" -> serveGetClipboard()
+                method == Method.GET && uri == "/outbox" -> serveOutboxList()
+                method == Method.GET && uri.startsWith("/outbox/") -> serveOutboxDownload(uri)
+                method == Method.DELETE && uri.startsWith("/outbox/") -> serveOutboxDelete(uri)
+                method == Method.POST && uri == "/announce" -> serveAnnounce(session)
                 else -> newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
             }
         } catch (e: Exception) {
@@ -56,7 +60,7 @@ class PushServer(
         Thread {
             try {
                 val port = NsdHelper.MAC_PORT
-                val conn = URL("http://$ip:$port/status").openConnection() as HttpURLConnection
+                val conn = URL("http://$ip:$port/status").openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
                 conn.connectTimeout = 2000
                 conn.readTimeout = 2000
                 val code = conn.responseCode
@@ -197,9 +201,67 @@ class PushServer(
         return json(Response.Status.OK, JSONObject().put("ok", true).put("chars", text.length))
     }
 
+    /** Mac announces itself to the phone so phone doesn't need to scan. */
+    private fun serveAnnounce(session: IHTTPSession): Response {
+        val body = readBody(session)
+        return try {
+            val obj = JSONObject(body)
+            val host = obj.optString("host", "")
+            val port = obj.optInt("port", NsdHelper.MAC_PORT)
+            if (host.isBlank()) {
+                json(Response.Status.BAD_REQUEST, JSONObject().put("error", "missing host"))
+            } else {
+                Log.i("PushServer", "Mac announced itself: $host:$port")
+                onMacDetected?.invoke(host, port)
+                json(Response.Status.OK, JSONObject().put("ok", true).put("saved", "$host:$port"))
+            }
+        } catch (e: Exception) {
+            json(Response.Status.BAD_REQUEST, JSONObject().put("error", e.message))
+        }
+    }
+
     private fun serveGetClipboard(): Response {
         // Can't read clipboard from background thread on Android, return empty
         return json(Response.Status.OK, JSONObject().put("text", "").put("note", "use UI to send clipboard"))
+    }
+
+    // ── Outbox: files waiting for Mac to pull ──────────────
+
+    private fun serveOutboxList(): Response {
+        val arr = JSONArray()
+        val outbox = repo.outboxDir
+        outbox.listFiles()?.filter { it.isFile && !it.name.startsWith(".") }?.forEach { f ->
+            arr.put(JSONObject()
+                .put("name", f.name)
+                .put("size", f.length())
+                .put("timestamp", f.lastModified()))
+        }
+        return json(Response.Status.OK, JSONObject().put("files", arr))
+    }
+
+    private fun serveOutboxDownload(uri: String): Response {
+        val name = uri.removePrefix("/outbox/")
+        val file = File(repo.outboxDir, name)
+        if (!file.exists() || file.parentFile != repo.outboxDir) {
+            return json(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
+        }
+        val mime = when (file.extension.lowercase()) {
+            "txt", "md", "json", "log", "csv" -> "text/plain"
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            else -> "application/octet-stream"
+        }
+        return newFixedLengthResponse(Response.Status.OK, mime, file.inputStream(), file.length())
+    }
+
+    private fun serveOutboxDelete(uri: String): Response {
+        val name = uri.removePrefix("/outbox/")
+        val file = File(repo.outboxDir, name)
+        return if (file.exists() && file.parentFile == repo.outboxDir && file.delete()) {
+            json(Response.Status.OK, JSONObject().put("deleted", name))
+        } else {
+            json(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
+        }
     }
 
     private fun extractFilename(session: IHTTPSession): String? {

@@ -7,8 +7,7 @@ import android.os.Build
 import android.util.Log
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONObject
 
 class NsdHelper(private val context: Context) {
     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -80,129 +79,19 @@ class NsdHelper(private val context: Context) {
         unregister()
     }
 
-    // ── Mac Discovery via HTTP scan ─────────────────────────
+    // ── Mac Verification (no scanning — Mac announces itself) ──
 
-    private val scanning = AtomicBoolean(false)
-
-    /**
-     * Find Mac by HTTP: first check saved IP, then scan subnet.
-     * Much more reliable than NSD on Chinese Android phones.
-     */
-    fun discoverMac() {
-        if (scanning.getAndSet(true)) return
-        Thread {
-            try {
-                // 1. Try saved IP first (longer timeout, most reliable)
-                val savedHost = prefs.getString("mac_host", null)
-                if (savedHost != null && checkMac(savedHost, macPort, 3000)) {
-                    macHost = savedHost
-                    Log.i(TAG, "Mac verified at saved IP: $savedHost:$macPort")
-                    return@Thread
-                }
-
-                // 2. Collect all available IPs to scan from (WiFi client + hotspot)
-                val scanIps = mutableListOf<String>()
-
-                // WiFi client IP
-                val wifiIp = PushService.getWifiIp(context)
-                if (wifiIp != "0.0.0.0") {
-                    scanIps.add(wifiIp)
-                }
-
-                // Hotspot IP (phone is AP — Mac might be connected as client)
-                val hotspotIp = PushService.getHotspotIp()
-                if (hotspotIp != null && hotspotIp !in scanIps) {
-                    scanIps.add(hotspotIp)
-                    Log.i(TAG, "Hotspot active at $hotspotIp, will scan for Mac clients")
-                }
-
-                if (scanIps.isEmpty()) {
-                    Log.i(TAG, "No network IP available (no WiFi, no hotspot), skipping scan")
-                    return@Thread
-                }
-
-                // Build unique list of subnets to scan from all IPs
-                val subnets = mutableListOf<String>()
-                for (ip in scanIps) {
-                    val parts = ip.split(".")
-                    if (parts.size != 4) continue
-                    val prefix = "${parts[0]}.${parts[1]}"
-                    val thirdOctet = parts[2].toIntOrNull() ?: continue
-                    val base = "$prefix.$thirdOctet"
-                    if (base !in subnets) subnets.add(base)
-                    // Add neighbor subnets only for WiFi client (hotspot subnet is usually small)
-                    if (ip == wifiIp) {
-                        for (offset in 1..NEIGHBOR_SUBNET_RANGE) {
-                            val sub1 = "$prefix.${thirdOctet - offset}"
-                            val sub2 = "$prefix.${thirdOctet + offset}"
-                            if (thirdOctet - offset >= 0 && sub1 !in subnets) subnets.add(sub1)
-                            if (thirdOctet + offset <= 255 && sub2 !in subnets) subnets.add(sub2)
-                        }
-                    }
-                }
-
-                val myIps = scanIps.toSet()
-                Log.i(TAG, "Scanning ${subnets.size} subnet(s) for Mac (my IPs: ${scanIps.joinToString()}): ${subnets.joinToString()}")
-
-                val found = AtomicBoolean(false)
-                for (subnet in subnets) {
-                    if (found.get()) break
-                    Log.i(TAG, "Scanning subnet $subnet.*")
-                    val executor = Executors.newFixedThreadPool(30)
-                    try {
-                        for (i in 1..254) {
-                            if (found.get()) break
-                            val ip = "$subnet.$i"
-                            if (ip in myIps) continue
-                            executor.submit {
-                                if (!found.get() && checkMac(ip, MAC_PORT, 1500)) {
-                                    found.set(true)
-                                    macHost = ip
-                                    macPort = MAC_PORT
-                                    prefs.edit()
-                                        .putString("mac_host", ip)
-                                        .putInt("mac_port", MAC_PORT)
-                                        .apply()
-                                    Log.i(TAG, "Mac found via scan: $ip:18081")
-                                }
-                            }
-                        }
-                    } finally {
-                        executor.shutdown()
-                    }
-                    if (!executor.awaitTermination(20, java.util.concurrent.TimeUnit.SECONDS)) {
-                        executor.shutdownNow()
-                    }
-                }
-
-                if (!found.get()) {
-                    Log.i(TAG, "Mac not found on ${subnets.size} subnet(s)")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Discovery error", e)
-            } finally {
-                scanning.set(false)
-            }
-        }.start()
+    /** Restore macHost from prefs if not set (e.g. after process restart). */
+    fun restoreFromPrefs() {
+        if (macHost == null) {
+            macHost = prefs.getString("mac_host", null)
+            macPort = prefs.getInt("mac_port", MAC_PORT)
+        }
     }
 
-    /** Periodic re-check: verify Mac is still reachable, or re-scan. */
-    fun recheckMac() {
-        val host = macHost
-        if (host != null && checkMac(host, macPort, 3000)) return
-        // Don't clear macHost — keep saved value as fallback for uploads
-        // Just try to discover again in background
-        discoverMac()
-    }
-
-    /** Check if current Mac is reachable (used by PushService for retry logic). */
-    fun isMacReachable(): Boolean {
-        val host = macHost ?: return false
-        return checkMac(host, macPort, 3000)
-    }
-
-    /** Called when Mac is auto-detected from an incoming push connection. */
-    fun saveMacHost(host: String, port: Int) {
+    /** Called when Mac is auto-detected from an incoming push connection or /announce. */
+    fun saveMacHost(host: String, port: Int, announce: Boolean = true) {
+        val isNew = host != macHost
         macHost = host
         macPort = port
         prefs.edit()
@@ -210,18 +99,40 @@ class NsdHelper(private val context: Context) {
             .putInt("mac_port", port)
             .apply()
         Log.i(TAG, "Mac saved: $host:$port")
+        // Announce ourselves to Mac so it knows about us too
+        if (isNew && announce) {
+            Thread { announceToMac(host, port) }.start()
+        }
+    }
+
+    /** Tell the Mac our IP so it knows about us immediately. */
+    private fun announceToMac(macHost: String, macPort: Int) {
+        try {
+            val myIp = PushService.getWifiIp(context)
+            if (myIp == "0.0.0.0") return
+            val json = org.json.JSONObject()
+                .put("host", myIp)
+                .put("port", PushService.SERVER_PORT)
+            val url = URL("http://$macHost:$macPort/announce")
+            val conn = url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.connectTimeout = 3000
+            conn.readTimeout = 3000
+            conn.outputStream.use { it.write(json.toString().toByteArray()) }
+            val code = conn.responseCode
+            conn.disconnect()
+            Log.i(TAG, "Announced to Mac $macHost:$macPort → HTTP $code")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to announce to Mac: ${e.message}")
+        }
     }
 
     private fun checkMac(host: String, port: Int, timeoutMs: Int): Boolean {
         return try {
             val url = URL("http://$host:$port/status")
-            // Bind to WiFi network if available
-            val wifiNetwork = PushService.getWifiNetwork()
-            val conn = if (wifiNetwork != null) {
-                wifiNetwork.openConnection(url) as HttpURLConnection
-            } else {
-                url.openConnection() as HttpURLConnection
-            }
+            val conn = url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
             conn.connectTimeout = timeoutMs
             conn.readTimeout = timeoutMs
             conn.useCaches = false
@@ -242,7 +153,5 @@ class NsdHelper(private val context: Context) {
         private const val TAG = "NsdHelper"
         /** Mac receiver port — must match PORT in claude_push_mac.py */
         const val MAC_PORT = 18081
-        /** How many neighboring subnets to scan (e.g. 2 = scan ±2 from own third octet) */
-        private const val NEIGHBOR_SUBNET_RANGE = 2
     }
 }

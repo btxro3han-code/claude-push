@@ -475,11 +475,13 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         p = urlparse(self.path).path
         if p == "/status":
+            my_ip = get_local_ip()
             self._json(200, {
                 "status": "ok",
                 "hostname": socket.gethostname(),
                 "platform": "macOS",
                 "port": PORT,
+                "host": my_ip,
             })
         elif p == "/files":
             self._files_list()
@@ -491,6 +493,11 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path).path
+
+        # Handle /announce before saving phone IP (it carries explicit host info)
+        if p == "/announce":
+            self._handle_announce()
+            return
 
         # Save phone IP from incoming request
         client_ip = self.client_address[0] if self.client_address else None
@@ -505,6 +512,24 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
             self._set_clipboard()
         else:
             self._json(404, {"error": "not found"})
+
+    def _handle_announce(self):
+        """Phone announces itself to Mac."""
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            data = json.loads(body)
+            host = data.get("host", "")
+            port = data.get("port", PHONE_PORT)
+            if not host:
+                self._json(400, {"error": "missing host"})
+                return
+            _logger.info(f"[announce] Phone announced itself: {host}:{port}")
+            if self.app_ref:
+                self.app_ref.save_phone_ip(host, check_phone(host, port, timeout=2), announce=False)
+            self._json(200, {"ok": True, "saved": f"{host}:{port}"})
+        except Exception as e:
+            self._json(400, {"error": str(e)})
 
     def _files_list(self):
         RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -817,15 +842,17 @@ class ClaudePushApp(rumps.App):
             self.mdns_proc.terminate()
             self.mdns_proc = None
 
-    def save_phone_ip(self, ip, device_data=None):
-        """Save phone IP when it connects to us or is discovered."""
+    def save_phone_ip(self, ip, device_data=None, announce=True):
+        """Save phone IP when it connects to us or is discovered.
+        Set announce=False when phone told us about itself (avoid echo loop)."""
         if not ip:
             return
         is_adb = (ip == "127.0.0.1")
         if is_adb and not self.phone_via_adb:
             return  # Don't save 127.0.0.1 from random localhost connections
 
-        if ip != self.phone_ip or (device_data and not self.phone_device_id):
+        is_new = ip != self.phone_ip
+        if is_new or (device_data and not self.phone_device_id):
             self.phone_ip = ip
             self.phone_via_adb = is_adb
             try:
@@ -843,6 +870,27 @@ class ClaudePushApp(rumps.App):
                     pass
 
             self._update_phone_menu()
+
+            # Announce ourselves to the phone so it knows our IP immediately
+            if is_new and not is_adb and announce:
+                threading.Thread(target=self._announce_to_phone, args=(ip,), daemon=True).start()
+
+    def _announce_to_phone(self, phone_ip):
+        """Tell the phone our IP and port so it doesn't need to scan for us."""
+        my_ip = get_local_ip()
+        if my_ip == "127.0.0.1":
+            return
+        try:
+            data = json.dumps({"host": my_ip, "port": PORT}).encode("utf-8")
+            status, resp = _lan_request(
+                phone_ip, PHONE_PORT, "POST", "/announce",
+                body=data,
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+            _logger.info(f"[announce] Told phone {phone_ip} we're at {my_ip}:{PORT} → HTTP {status}")
+        except Exception as e:
+            _logger.warning(f"[announce] Failed to announce to {phone_ip}: {e}")
 
     def _get_phone_target(self):
         """Get phone IP:PORT."""

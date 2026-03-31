@@ -18,6 +18,7 @@ data class ReceivedFile(
 
 class FileRepository(private val context: Context) {
     val dir: File = File(context.getExternalFilesDir(null), "received").also { it.mkdirs() }
+    val outboxDir: File = File(context.getExternalFilesDir(null), "outbox").also { it.mkdirs() }
     private val hiddenFile = File(dir, ".hidden")
     private var hiddenCache: MutableSet<String>? = null
 
@@ -126,6 +127,23 @@ class FileRepository(private val context: Context) {
         } catch (e: Exception) {
             Log.e("FileRepository", "Failed to save to gallery: ${file.name}", e)
         }
+    }
+
+    /** Save a file to outbox for Mac to pull. */
+    fun saveToOutbox(input: InputStream, filename: String): File {
+        val safe = filename.replace(Regex("[/\\\\]"), "_")
+        var target = File(outboxDir, safe)
+        if (target.exists()) {
+            val base = safe.substringBeforeLast(".")
+            val ext = safe.substringAfterLast(".", "")
+            var i = 1
+            while (target.exists()) {
+                target = File(outboxDir, if (ext.isNotEmpty()) "${base}_$i.$ext" else "${base}_$i")
+                i++
+            }
+        }
+        input.use { src -> target.outputStream().use { src.copyTo(it) } }
+        return target
     }
 
     fun get(name: String): File? {

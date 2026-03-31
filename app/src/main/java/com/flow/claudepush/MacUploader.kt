@@ -24,16 +24,7 @@ object MacUploader {
                 val boundary = "----${System.currentTimeMillis()}"
 
                 val url = URL("http://$host:$port/push?filename=$encoded")
-
-                // Bind connection to WiFi network to avoid routing over cellular
-                val wifiNetwork = PushService.getWifiNetwork()
-                val conn = if (wifiNetwork != null) {
-                    Log.d("MacUploader", "Using WiFi-bound connection")
-                    wifiNetwork.openConnection(url) as HttpURLConnection
-                } else {
-                    Log.d("MacUploader", "No WiFi network bound, using default connection")
-                    url.openConnection() as HttpURLConnection
-                }
+                val conn = openLanConnection(url)
 
                 conn.requestMethod = "POST"
                 conn.doOutput = true
@@ -92,6 +83,15 @@ object MacUploader {
             return size
         }
         throw Exception("Cannot determine file size")
+    }
+
+    /**
+     * Open HTTP connection to LAN host, preferring default (unbound) connection.
+     * WiFi network binding on vivo causes connection resets to LAN hosts.
+     * Default connection works fine for same-subnet LAN targets.
+     */
+    internal fun openLanConnection(url: URL): HttpURLConnection {
+        return url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
     }
 
     private fun getFileName(context: Context, uri: Uri): String {
