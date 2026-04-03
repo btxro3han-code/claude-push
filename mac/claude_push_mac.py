@@ -196,19 +196,14 @@ def _lan_request(host, port, method, path, body=None, headers=None, timeout=5):
 
 def check_phone(host, port=PHONE_PORT, timeout=3):
     """Check if a Claude Push phone is reachable at host:port.
-    Uses curl to bypass macOS Network Extension interception.
     Returns status dict (with _latency_ms, _checked_ip) or None."""
     try:
         start = _time.monotonic()
-        r = subprocess.run(
-            ["curl", "-s", "--noproxy", "*", "--connect-timeout", str(min(timeout, 5)),
-             "-m", str(timeout), f"http://{host}:{port}/status"],
-            capture_output=True, text=True, timeout=timeout + 3
-        )
+        status_code, body = _lan_request(host, port, "GET", "/status", timeout=timeout)
         latency = (_time.monotonic() - start) * 1000
-        if r.returncode != 0:
+        if status_code != 200:
             return None
-        data = json.loads(r.stdout)
+        data = json.loads(body)
         if data.get("platform") == "Android" or data.get("device"):
             data["_latency_ms"] = round(latency, 1)
             data["_checked_ip"] = host
