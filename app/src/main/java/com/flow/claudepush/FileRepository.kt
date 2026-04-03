@@ -129,23 +129,6 @@ class FileRepository(private val context: Context) {
         }
     }
 
-    /** Save a file to outbox for Mac to pull. */
-    fun saveToOutbox(input: InputStream, filename: String): File {
-        val safe = filename.replace(Regex("[/\\\\]"), "_")
-        var target = File(outboxDir, safe)
-        if (target.exists()) {
-            val base = safe.substringBeforeLast(".")
-            val ext = safe.substringAfterLast(".", "")
-            var i = 1
-            while (target.exists()) {
-                target = File(outboxDir, if (ext.isNotEmpty()) "${base}_$i.$ext" else "${base}_$i")
-                i++
-            }
-        }
-        input.use { src -> target.outputStream().use { src.copyTo(it) } }
-        return target
-    }
-
     fun get(name: String): File? {
         val f = File(dir, name)
         return if (f.exists() && f.parentFile == dir) f else null
@@ -163,6 +146,7 @@ class FileRepository(private val context: Context) {
         type = when (extension.lowercase()) {
             "apk" -> "apk"
             "jpg", "jpeg", "png", "gif", "webp", "bmp" -> "image"
+            "mp4", "mov", "avi", "mkv", "webm" -> "video"
             "txt", "md", "json", "log", "csv", "xml", "html" -> "text"
             else -> "file"
         }

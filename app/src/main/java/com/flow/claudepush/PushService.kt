@@ -267,7 +267,6 @@ class PushService : Service() {
         const val ACTION_FILE_CHANGED = "com.flow.claudepush.FILE_CHANGED"
         const val ACTION_NETWORK_CHANGED = "com.flow.claudepush.NETWORK_CHANGED"
         const val SERVER_PORT = 18080
-        private const val MSG_REDISCOVER = 1001
 
         private var _nsdRef: NsdHelper? = null
 
@@ -325,6 +324,37 @@ class PushService : Service() {
             return NetAddresses(wlan, hotspot, fallback)
         }
 
+        /**
+         * Get all reachable IPv4 addresses for this device, categorized by type.
+         * Used by /status to let Mac pick the fastest route.
+         */
+        fun getAllIps(): Map<String, String> {
+            val ips = mutableMapOf<String, String>()
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                while (interfaces.hasMoreElements()) {
+                    val iface = interfaces.nextElement()
+                    if (iface.isLoopback || !iface.isUp) continue
+                    val name = iface.name
+                    val addrs = iface.inetAddresses
+                    while (addrs.hasMoreElements()) {
+                        val addr = addrs.nextElement()
+                        if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                            val ip = addr.hostAddress ?: continue
+                            when {
+                                name.startsWith("wlan") && !isHotspotInterface(name) -> ips["lan"] = ip
+                                isHotspotInterface(name) -> ips["hotspot"] = ip
+                                // Tailscale uses 100.64.0.0/10 (second octet 64-127)
+                                isTailscaleIp(ip) -> ips["tailscale"] = ip
+                                else -> ips.putIfAbsent("other", ip)
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+            return ips
+        }
+
         fun getWifiIp(): String {
             val addrs = enumerateIpv4()
             return addrs.wlanIp ?: addrs.hotspotIp ?: addrs.fallbackIp ?: "0.0.0.0"
@@ -337,6 +367,13 @@ class PushService : Service() {
                     name == "wlan1" ||              // some devices use wlan1 for AP
                     name.startsWith("rndis") ||     // USB tethering
                     name.startsWith("bt-pan")       // Bluetooth tethering
+        }
+
+        /** Check if IP is in Tailscale's CGNAT range 100.64.0.0/10 */
+        private fun isTailscaleIp(ip: String): Boolean {
+            if (!ip.startsWith("100.")) return false
+            val second = ip.split(".").getOrNull(1)?.toIntOrNull() ?: return false
+            return second in 64..127
         }
 
         /** Get the hotspot/tethering IP if active, or null. */
@@ -384,6 +421,18 @@ class PushService : Service() {
                     val caps = cm.getNetworkCapabilities(activeNet)
                     if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
                         ipv4FromLinkProperties(cm.getLinkProperties(activeNet))?.let { return it }
+                    }
+                }
+                // When Tailscale VPN is active, activeNetwork may be VPN not WiFi.
+                // Enumerate all networks to find the WiFi one underneath.
+                // Note: do NOT update _wifiNetwork here — only NetworkCallback should manage that state.
+                for (net in cm.allNetworks) {
+                    val c = cm.getNetworkCapabilities(net) ?: continue
+                    if (c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                        !c.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                        ipv4FromLinkProperties(cm.getLinkProperties(net))?.let {
+                            return it
+                        }
                     }
                 }
             } catch (_: Exception) {}

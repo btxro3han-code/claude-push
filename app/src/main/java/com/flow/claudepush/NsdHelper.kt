@@ -110,9 +110,13 @@ class NsdHelper(private val context: Context) {
         try {
             val myIp = PushService.getWifiIp(context)
             if (myIp == "0.0.0.0") return
+            val allIps = PushService.getAllIps()
+            val ipsJson = org.json.JSONObject()
+            for ((k, v) in allIps) ipsJson.put(k, v)
             val json = org.json.JSONObject()
                 .put("host", myIp)
                 .put("port", PushService.SERVER_PORT)
+                .put("ips", ipsJson)
             val url = URL("http://$macHost:$macPort/announce")
             val conn = url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
             conn.requestMethod = "POST"
@@ -123,29 +127,9 @@ class NsdHelper(private val context: Context) {
             conn.outputStream.use { it.write(json.toString().toByteArray()) }
             val code = conn.responseCode
             conn.disconnect()
-            Log.i(TAG, "Announced to Mac $macHost:$macPort → HTTP $code")
+            Log.i(TAG, "Announced to Mac $macHost:$macPort → HTTP $code (ips=$allIps)")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to announce to Mac: ${e.message}")
-        }
-    }
-
-    private fun checkMac(host: String, port: Int, timeoutMs: Int): Boolean {
-        return try {
-            val url = URL("http://$host:$port/status")
-            val conn = url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
-            conn.connectTimeout = timeoutMs
-            conn.readTimeout = timeoutMs
-            conn.useCaches = false
-            val code = conn.responseCode
-            if (code != 200) { conn.disconnect(); return false }
-            val body = conn.inputStream.bufferedReader().readText()
-            conn.disconnect()
-            val ok = body.contains("macOS")
-            if (!ok) Log.d(TAG, "checkMac $host:$port → code=$code")
-            ok
-        } catch (e: Exception) {
-            Log.d(TAG, "checkMac $host:$port → ${e.javaClass.simpleName}: ${e.message}")
-            false
         }
     }
 

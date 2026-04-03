@@ -41,7 +41,6 @@ class PushServer(
                 method == Method.POST && uri == "/push" -> servePushFile(session)
                 method == Method.POST && uri == "/push/text" -> servePushText(session)
                 method == Method.POST && uri == "/clipboard" -> serveSetClipboard(session)
-                method == Method.GET && uri == "/clipboard" -> serveGetClipboard()
                 method == Method.GET && uri == "/outbox" -> serveOutboxList()
                 method == Method.GET && uri.startsWith("/outbox/") -> serveOutboxDownload(uri)
                 method == Method.DELETE && uri.startsWith("/outbox/") -> serveOutboxDelete(uri)
@@ -80,6 +79,9 @@ class PushServer(
     }
 
     private fun serveStatus(): Response {
+        val allIps = PushService.getAllIps()
+        val ipsJson = JSONObject()
+        for ((k, v) in allIps) ipsJson.put(k, v)
         val obj = JSONObject()
             .put("device", Build.MODEL)
             .put("brand", Build.BRAND)
@@ -89,6 +91,7 @@ class PushServer(
             .put("free_space_mb", repo.dir.freeSpace / 1024 / 1024)
             .put("device_id", getDeviceId())
             .put("platform", "Android")
+            .put("ips", ipsJson)
         return json(Response.Status.OK, obj)
     }
 
@@ -218,11 +221,6 @@ class PushServer(
         } catch (e: Exception) {
             json(Response.Status.BAD_REQUEST, JSONObject().put("error", e.message))
         }
-    }
-
-    private fun serveGetClipboard(): Response {
-        // Can't read clipboard from background thread on Android, return empty
-        return json(Response.Status.OK, JSONObject().put("text", "").put("note", "use UI to send clipboard"))
     }
 
     // ── Outbox: files waiting for Mac to pull ──────────────
