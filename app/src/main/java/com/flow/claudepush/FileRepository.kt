@@ -51,7 +51,7 @@ class FileRepository(private val context: Context) {
         saveHidden(set)
     }
 
-    fun save(input: InputStream, filename: String): ReceivedFile {
+    private fun deduplicateFile(dir: File, filename: String): File {
         val safe = filename.replace(Regex("[/\\\\]"), "_")
         var target = File(dir, safe)
         if (target.exists()) {
@@ -63,14 +63,16 @@ class FileRepository(private val context: Context) {
                 i++
             }
         }
-        input.use { src -> target.outputStream().use { src.copyTo(it) } }
+        return target
+    }
 
-        // 图片/视频自动写入公共相册
+    fun save(input: InputStream, filename: String): ReceivedFile {
+        val target = deduplicateFile(dir, filename)
+        input.use { src -> target.outputStream().use { src.copyTo(it) } }
         val received = target.toReceivedFile()
         if (received.type == "image" || received.type == "video") {
             copyToMediaStore(target, received)
         }
-
         return received
     }
 

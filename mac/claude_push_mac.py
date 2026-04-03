@@ -123,8 +123,8 @@ def format_size(n):
         return f"{n / 1024 / 1024:.1f} MB"
 
 
-def save_file(filename, data):
-    """Save data to RECEIVE_DIR with collision handling."""
+def _dedup_path(filename):
+    """Return a collision-free Path in RECEIVE_DIR for the given filename."""
     RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
     filename = re.sub(r'[/\\]', '_', filename)
     path = RECEIVE_DIR / filename
@@ -134,6 +134,12 @@ def save_file(filename, data):
         while path.exists():
             path = RECEIVE_DIR / f"{stem}_{i}{ext}"
             i += 1
+    return path
+
+
+def save_file(filename, data):
+    """Save data to RECEIVE_DIR with collision handling."""
+    path = _dedup_path(filename)
     path.write_bytes(data)
     return path
 
@@ -628,15 +634,7 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
             filename = f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         # Stream data range to final file without loading into memory
-        RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
-        final_filename = re.sub(r'[/\\]', '_', filename)
-        final_path = RECEIVE_DIR / final_filename
-        if final_path.exists():
-            stem, ext = final_path.stem, final_path.suffix
-            i = 1
-            while final_path.exists():
-                final_path = RECEIVE_DIR / f"{stem}_{i}{ext}"
-                i += 1
+        final_path = _dedup_path(filename)
 
         CHUNK = 256 * 1024
         data_len = data_end - data_start
