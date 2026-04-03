@@ -17,7 +17,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -66,132 +65,7 @@ PORT = 18081
 PHONE_PORT = 18080
 PHONE_CONFIG = Path.home() / ".claude" / "push_target"
 PHONE_DEVICE_CONFIG = Path.home() / ".claude" / "push_device"  # stores device_id for fingerprint
-ICON_DIR = Path(tempfile.gettempdir()) / "claudepush_icons"
 ADB_FORWARD_PORT = 18080  # local port for ADB forwarding
-
-
-def _create_ouroboros_icon(flash=False):
-    """Create ouroboros menu bar icon as PNG using PIL. Witcher silver-grey."""
-    ICON_DIR.mkdir(exist_ok=True)
-    suffix = "_flash" if flash else ""
-    path = ICON_DIR / f"ouroboros{suffix}.png"
-
-    try:
-        from PIL import Image, ImageDraw
-        import math
-
-        size = 88  # @2x for retina
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        cx, cy = size / 2, size / 2
-        r = size * 0.34
-        bw = size * 0.09  # body half-width
-
-        c_body = (220, 222, 225, 255) if flash else (140, 143, 147, 255)
-        c_tail = (220, 222, 225, 255) if flash else (110, 113, 116, 255)
-        c_eye = (60, 62, 65, 255) if flash else (210, 213, 216, 255)
-        c_scale = (220, 222, 225, 255) if flash else (100, 103, 106, 255)
-
-        gap = 55  # degrees gap at top
-
-        # ── Body ring as filled polygon (outer arc + inner arc) ──
-        head_deg = 90 - gap // 2   # right side of gap
-        tail_deg = 90 + gap // 2   # left side of gap
-
-        # Build outer arc points (tail → clockwise around → head)
-        outer_pts = []
-        for d in range(tail_deg, tail_deg + (360 - gap) + 1):
-            a = math.radians(d % 360)
-            outer_pts.append((cx + (r + bw) * math.cos(a),
-                              cy - (r + bw) * math.sin(a)))
-
-        # Build inner arc points (head → counterclockwise → tail)
-        inner_pts = []
-        for d in range(head_deg + (360 - gap), tail_deg - 1, -1):
-            a = math.radians(d % 360)
-            inner_pts.append((cx + (r - bw) * math.cos(a),
-                              cy - (r - bw) * math.sin(a)))
-
-        draw.polygon(outer_pts + inner_pts, fill=c_body)
-
-        # ── Head: upper jaw ──
-        ha = math.radians(head_deg)
-        # Outer edge of body at head
-        h_out_x = cx + (r + bw) * math.cos(ha)
-        h_out_y = cy - (r + bw) * math.sin(ha)
-        # Extended jaw point (further out)
-        jaw_ext_a = math.radians(head_deg + 12)
-        je_x = cx + (r + bw * 2.8) * math.cos(jaw_ext_a)
-        je_y = cy - (r + bw * 2.8) * math.sin(jaw_ext_a)
-        # Jaw tip (toward mouth center, at top)
-        mouth_a = math.radians(90)
-        jt_x = cx + (r + bw * 1.5) * math.cos(mouth_a)
-        jt_y = cy - (r + bw * 1.5) * math.sin(mouth_a)
-
-        draw.polygon([(h_out_x, h_out_y), (je_x, je_y), (jt_x, jt_y)],
-                     fill=c_body)
-
-        # ── Head: lower jaw (smaller) ──
-        h_in_x = cx + (r - bw) * math.cos(ha)
-        h_in_y = cy - (r - bw) * math.sin(ha)
-        # Lower jaw tip
-        ljt_x = cx + (r - bw * 0.5) * math.cos(mouth_a)
-        ljt_y = cy - (r - bw * 0.5) * math.sin(mouth_a)
-        # Mid point for shape
-        lm_a = math.radians(head_deg + 8)
-        lm_x = cx + (r - bw * 0.2) * math.cos(lm_a)
-        lm_y = cy - (r - bw * 0.2) * math.sin(lm_a)
-
-        draw.polygon([(h_in_x, h_in_y), (lm_x, lm_y), (ljt_x, ljt_y)],
-                     fill=c_body)
-
-        # ── Tail: tapers from body width to thin point entering mouth ──
-        ta = math.radians(tail_deg)
-        t_out_x = cx + (r + bw) * math.cos(ta)
-        t_out_y = cy - (r + bw) * math.sin(ta)
-        t_in_x = cx + (r - bw) * math.cos(ta)
-        t_in_y = cy - (r - bw) * math.sin(ta)
-
-        # Tail tip (thin, entering between the jaws)
-        tip_x = cx + (r + bw * 0.5) * math.cos(mouth_a)
-        tip_y = cy - (r + bw * 0.5) * math.sin(mouth_a)
-
-        # Curved tail using intermediate points
-        mid_a = math.radians(tail_deg - 10)
-        tm_out_x = cx + (r + bw * 0.6) * math.cos(mid_a)
-        tm_out_y = cy - (r + bw * 0.6) * math.sin(mid_a)
-        tm_in_x = cx + (r - bw * 0.3) * math.cos(mid_a)
-        tm_in_y = cy - (r - bw * 0.3) * math.sin(mid_a)
-
-        draw.polygon([
-            (t_out_x, t_out_y), (tm_out_x, tm_out_y),
-            (tip_x, tip_y),
-            (tm_in_x, tm_in_y), (t_in_x, t_in_y)
-        ], fill=c_tail)
-
-        # ── Eye ──
-        eye_a = math.radians(head_deg + 10)
-        eye_r_pos = r + bw * 1.5
-        ex = cx + eye_r_pos * math.cos(eye_a)
-        ey = cy - eye_r_pos * math.sin(eye_a)
-        er = size * 0.03
-        draw.ellipse([(ex - er, ey - er), (ex + er, ey + er)], fill=c_eye)
-
-        # ── Scale marks along the body ──
-        for d in range(tail_deg + 30, tail_deg + 330, 40):
-            a = math.radians(d % 360)
-            sx1 = cx + (r - bw * 0.6) * math.cos(a)
-            sy1 = cy - (r - bw * 0.6) * math.sin(a)
-            sx2 = cx + (r + bw * 0.6) * math.cos(a)
-            sy2 = cy - (r + bw * 0.6) * math.sin(a)
-            draw.line([(sx1, sy1), (sx2, sy2)], fill=c_scale, width=1)
-
-        img.save(str(path))
-        return str(path)
-    except Exception as e:
-        _logger.warning(f"Could not create icon: {e}")
-        return None
 
 
 def get_local_ip():
@@ -871,10 +745,6 @@ class ClaudePushApp(rumps.App):
         icon_dir = Path(__file__).parent
         icon_path = str(icon_dir / "icon_menubar.png")
         flash_path = str(icon_dir / "icon_menubar_flash.png")
-        # Fallback to generated icons if files missing
-        if not Path(icon_path).exists():
-            icon_path = _create_ouroboros_icon()
-            flash_path = _create_ouroboros_icon(flash=True)
         super().__init__("", icon=icon_path, quit_button=None)
         # Hide Dock icon (menu bar agent only)
         try:
