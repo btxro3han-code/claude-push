@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, quote
@@ -63,8 +62,6 @@ except ImportError:
 _drop_callback = None  # set by ClaudePushApp for DropView to call
 
 RECEIVE_DIR = Path.home() / "Downloads" / "ClaudePush"
-DEV_IDEAS_DIR = Path.home() / "Documents" / "dev-ideas"
-NAS_URL = "https://xhs.royaldutchhome.com"
 PORT = 18081
 PHONE_PORT = 18080
 PHONE_CONFIG = Path.home() / ".claude" / "push_target"
@@ -319,21 +316,62 @@ def _lan_request(host, port, method, path, body=None, headers=None, timeout=5):
 
 def check_phone(host, port=PHONE_PORT, timeout=3):
     """Check if a Claude Push phone is reachable at host:port.
-    Uses curl to bypass macOS Network Extension interception."""
+    Uses curl to bypass macOS Network Extension interception.
+    Returns status dict (with _latency_ms, _checked_ip) or None."""
     try:
+        start = _time.monotonic()
         r = subprocess.run(
             ["curl", "-s", "--noproxy", "*", "--connect-timeout", str(min(timeout, 5)),
              "-m", str(timeout), f"http://{host}:{port}/status"],
             capture_output=True, text=True, timeout=timeout + 3
         )
+        latency = (_time.monotonic() - start) * 1000
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout)
         if data.get("platform") == "Android" or data.get("device"):
+            data["_latency_ms"] = round(latency, 1)
+            data["_checked_ip"] = host
             return data
     except Exception:
         pass
     return None
+
+
+def pick_fastest_ip(candidate_ips, port=PHONE_PORT, timeout=2):
+    """Race multiple candidate IPs in parallel, return (best_ip, status_data) or None.
+    Prefers LAN (192.168.x) over Tailscale (100.64-127.x) when latency is similar (<50ms diff)."""
+    if not candidate_ips:
+        return None
+    # Fast path: single IP, no need for thread pool
+    if len(candidate_ips) == 1:
+        data = check_phone(candidate_ips[0], port, timeout)
+        return (candidate_ips[0], data) if data else None
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidate_ips)) as pool:
+        futures = {pool.submit(check_phone, ip, port, timeout): ip for ip in candidate_ips}
+        for future in concurrent.futures.as_completed(futures, timeout=timeout + 3):
+            try:
+                data = future.result()
+                if data:
+                    results.append((futures[future], data))
+            except Exception:
+                pass
+    if not results:
+        return None
+    # Sort by latency
+    results.sort(key=lambda x: x[1].get("_latency_ms", 9999))
+    best_ip, best_data = results[0]
+    # If best is Tailscale (100.64-127.x) but a LAN option exists within 50ms, prefer LAN
+    if best_ip.startswith("100."):
+        for ip, data in results:
+            if not ip.startswith("100.") and not ip.startswith("127."):
+                delta = data.get("_latency_ms", float("inf")) - best_data.get("_latency_ms", float("inf"))
+                if delta < 50:
+                    _logger.info(f"[route] Prefer LAN {ip} ({data.get('_latency_ms')}ms) over Tailscale {best_ip} ({best_data.get('_latency_ms')}ms)")
+                    return ip, data
+    _logger.info(f"[route] Best route: {best_ip} ({best_data.get('_latency_ms')}ms)")
+    return best_ip, best_data
 
 
 def scan_subnet_for_phone(my_ip, timeout=3):
@@ -514,22 +552,46 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def _handle_announce(self):
-        """Phone announces itself to Mac."""
+        """Phone announces itself to Mac. If ips dict is present, race all IPs to find fastest.
+        Returns 200 immediately to avoid blocking the phone's HTTP client."""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
             host = data.get("host", "")
             port = data.get("port", PHONE_PORT)
+            ips_dict = data.get("ips", {})
             if not host:
                 self._json(400, {"error": "missing host"})
                 return
-            _logger.info(f"[announce] Phone announced itself: {host}:{port}")
-            if self.app_ref:
-                self.app_ref.save_phone_ip(host, check_phone(host, port, timeout=2), announce=False)
+            _logger.info(f"[announce] Phone announced: host={host} ips={ips_dict}")
+            # Return 200 immediately, race IPs in background
             self._json(200, {"ok": True, "saved": f"{host}:{port}"})
+            if self.app_ref:
+                # Collect all candidate IPs and race them in a daemon thread
+                candidates = set()
+                candidates.add(host)
+                # Also add the TCP connection source IP
+                if self.client_address and self.client_address[0]:
+                    candidates.add(self.client_address[0])
+                for ip in ips_dict.values():
+                    if ip:
+                        candidates.add(ip)
+                candidates.discard("0.0.0.0")
+                candidates.discard("127.0.0.1")
+                app = self.app_ref
+
+                def _race_and_save():
+                    result = pick_fastest_ip(list(candidates), port)
+                    if result:
+                        best_ip, status = result
+                        app.save_phone_ip(best_ip, status, announce=False)
+                    else:
+                        app.save_phone_ip(host, check_phone(host, port, timeout=2), announce=False)
+
+                threading.Thread(target=_race_and_save, daemon=True).start()
         except Exception as e:
-            self._json(400, {"error": str(e)})
+            _logger.error(f"[announce] Error: {e}")
 
     def _files_list(self):
         RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -632,7 +694,7 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
                 tmp_path.unlink(missing_ok=True)
 
     def _parse_multipart_from_file(self, tmp_path, ct, filename):
-        """Parse multipart from a temp file, extracting the file part without loading all into memory."""
+        """Parse multipart from a temp file, extracting the file part via streaming to avoid OOM."""
         boundary = None
         for seg in ct.split(";"):
             seg = seg.strip()
@@ -643,40 +705,80 @@ class ReceiveHandler(http.server.BaseHTTPRequestHandler):
             return
 
         sep = f"--{boundary}".encode()
-        end_sep = f"--{boundary}--".encode()
+        file_size = tmp_path.stat().st_size
 
+        # Stream-parse: read header (first ~4KB) to find data offset, then copy data range to file
         with open(tmp_path, "rb") as f:
-            raw = f.read()
+            # Read enough to cover boundary + headers (typically < 512 bytes)
+            head = f.read(min(4096, file_size))
 
-        parts = raw.split(sep)
-        for part in parts[1:]:
-            if part.startswith(b"--") or part.strip() == b"--":
-                break
-            if part.startswith(b"\r\n"):
-                part = part[2:]
-            if b"\r\n\r\n" not in part:
-                continue
-            hdr, data = part.split(b"\r\n\r\n", 1)
-            if data.endswith(b"\r\n"):
-                data = data[:-2]
-
-            if not filename:
-                for line in hdr.decode("utf-8", errors="replace").splitlines():
-                    if "filename=" in line:
-                        for s in line.split(";"):
-                            s = s.strip()
-                            if s.startswith("filename="):
-                                filename = s.split("=", 1)[1].strip('"')
-            if not filename:
-                filename = f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-            path = save_file(filename, data)
-            self._json(200, {"ok": True, "file": path.name, "size": len(data)})
-            if self.app_ref:
-                self.app_ref.on_file_received(path)
+        # Find the first boundary, then the header/data separator
+        first_sep = head.find(sep)
+        if first_sep < 0:
+            self._json(400, {"error": "no boundary found in body"})
             return
 
-        self._json(400, {"error": "no file in multipart"})
+        after_sep = first_sep + len(sep)
+        # Skip \r\n after boundary
+        if head[after_sep:after_sep + 2] == b"\r\n":
+            after_sep += 2
+
+        hdr_end = head.find(b"\r\n\r\n", after_sep)
+        if hdr_end < 0:
+            self._json(400, {"error": "malformed multipart header"})
+            return
+
+        hdr_bytes = head[after_sep:hdr_end]
+        data_start = hdr_end + 4  # skip \r\n\r\n
+
+        # The data ends at \r\n--{boundary}-- near end of file
+        end_marker = f"\r\n--{boundary}--".encode()
+        data_end = file_size - len(end_marker)
+        # Handle optional trailing \r\n after end marker
+        with open(tmp_path, "rb") as f:
+            f.seek(max(0, file_size - len(end_marker) - 4))
+            tail = f.read()
+        tail_idx = tail.find(b"\r\n" + sep + b"--")
+        if tail_idx >= 0:
+            data_end = max(0, file_size - len(tail) + tail_idx)
+
+        if not filename:
+            hdr_str = hdr_bytes.decode("utf-8", errors="replace")
+            for line in hdr_str.splitlines():
+                if "filename=" in line:
+                    for s in line.split(";"):
+                        s = s.strip()
+                        if s.startswith("filename="):
+                            filename = s.split("=", 1)[1].strip('"')
+        if not filename:
+            filename = f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Stream data range to final file without loading into memory
+        RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
+        final_filename = re.sub(r'[/\\]', '_', filename)
+        final_path = RECEIVE_DIR / final_filename
+        if final_path.exists():
+            stem, ext = final_path.stem, final_path.suffix
+            i = 1
+            while final_path.exists():
+                final_path = RECEIVE_DIR / f"{stem}_{i}{ext}"
+                i += 1
+
+        CHUNK = 256 * 1024
+        data_len = data_end - data_start
+        with open(tmp_path, "rb") as src, open(final_path, "wb") as dst:
+            src.seek(data_start)
+            remaining = data_len
+            while remaining > 0:
+                chunk = src.read(min(CHUNK, remaining))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                remaining -= len(chunk)
+
+        self._json(200, {"ok": True, "file": final_path.name, "size": data_len})
+        if self.app_ref:
+            self.app_ref.on_file_received(final_path)
 
 
 # ── Drop Zone Window ────────────────────────────────────────
@@ -774,6 +876,12 @@ class ClaudePushApp(rumps.App):
             icon_path = _create_ouroboros_icon()
             flash_path = _create_ouroboros_icon(flash=True)
         super().__init__("", icon=icon_path, quit_button=None)
+        # Hide Dock icon (menu bar agent only)
+        try:
+            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+            NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        except Exception:
+            pass
         self._icon_path = icon_path
         self._flash_icon_path = flash_path
         RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -784,7 +892,6 @@ class ClaudePushApp(rumps.App):
         self.phone_device_id = None  # device fingerprint
         self.phone_via_adb = False   # connected via USB?
         self._discover_lock = threading.Lock()
-        self._dev_polling = False
         self._drop_window = None
 
         # Load saved device ID
@@ -926,7 +1033,8 @@ class ClaudePushApp(rumps.App):
         threading.Thread(target=self._discover_phone, args=(True,), daemon=True).start()
 
     def _discover_phone(self, notify=False):
-        """Active phone discovery: saved IP → ADB USB → subnet scan."""
+        """Active phone discovery: saved IP → ADB USB → subnet scan.
+        When phone reports multiple IPs, race them all to find fastest route."""
         if not self._discover_lock.acquire(blocking=False):
             return
         try:
@@ -937,15 +1045,28 @@ class ClaudePushApp(rumps.App):
             _log = lambda msg: _logger.info(f"[discovery] {msg}")
             _log(f"start (saved={saved}, my_ip={get_local_ip()})")
 
-
             if saved:
                 host, _, port_s = saved.partition(":")
                 port = int(port_s) if port_s else PHONE_PORT
                 status = check_phone(host, port, timeout=2)
                 if status:
-                    self.save_phone_ip(host, status)
-                    _logger.info(f"[discovery] Phone verified at saved IP: {host}")
-                    found = True
+                    # If phone reports multiple IPs, race them to find best route
+                    ips_dict = status.get("ips", {})
+                    if ips_dict:
+                        candidates = set(ips_dict.values())
+                        candidates.add(host)
+                        candidates.discard("0.0.0.0")
+                        candidates.discard("127.0.0.1")
+                        result = pick_fastest_ip(list(candidates), port)
+                        if result:
+                            best_ip, best_status = result
+                            self.save_phone_ip(best_ip, best_status)
+                            _log(f"Phone verified, best route: {best_ip} ({best_status.get('_latency_ms')}ms)")
+                            found = True
+                    if not found:
+                        self.save_phone_ip(host, status)
+                        _log(f"Phone verified at saved IP: {host}")
+                        found = True
 
             # 2. Try ADB USB (works without any network)
             if not found:
@@ -968,8 +1089,18 @@ class ClaudePushApp(rumps.App):
                     result = scan_subnet_for_phone(my_ip)
                     if result:
                         ip, status = result
+                        # Check if phone has other IPs we should race
+                        ips_dict = status.get("ips", {})
+                        if ips_dict:
+                            candidates = set(ips_dict.values())
+                            candidates.add(ip)
+                            candidates.discard("0.0.0.0")
+                            candidates.discard("127.0.0.1")
+                            best = pick_fastest_ip(list(candidates))
+                            if best:
+                                ip, status = best
                         self.save_phone_ip(ip, status)
-                        _logger.info(f"[discovery] Phone found via scan: {ip} ({status.get('device', '?')})")
+                        _logger.info(f"[discovery] Phone found: {ip} ({status.get('device', '?')})")
                         found = True
                         if notify:
                             self._notify("Phone found", f"WiFi: {ip} ({status.get('device', 'unknown')})")
@@ -1027,63 +1158,6 @@ class ClaudePushApp(rumps.App):
             # No phone known — try to find one
             self._discover_phone()
         threading.Thread(target=_check, daemon=True).start()
-
-    @rumps.timer(60)
-    def _dev_poller(self, _):
-        """每60秒从 NAS 拉取开发心得"""
-        if self._dev_polling:
-            return
-        threading.Thread(target=self._poll_dev_ideas, daemon=True).start()
-
-    def _poll_dev_ideas(self):
-        self._dev_polling = True
-        ua = {"User-Agent": "ClaudePush/1.0"}
-        try:
-            req = urllib.request.Request(f"{NAS_URL}/dev-ideas", headers=ua)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                items = json.loads(resp.read()).get("files", [])
-        except Exception as e:
-            _logger.warning(f"[dev_poller] 拉取失败: {e}")
-            return
-        finally:
-            self._dev_polling = False
-
-        if not items:
-            return
-
-        DEV_IDEAS_DIR.mkdir(parents=True, exist_ok=True)
-        last_text = None
-
-        for item in items:
-            filename = item.get("file", "")
-            text = item.get("text", "")
-            if not filename or not text:
-                continue
-
-            # 保存到 dev-ideas 目录
-            (DEV_IDEAS_DIR / filename).write_text(text, encoding="utf-8")
-
-            # 存到 ClaudePush 目录并通知
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = save_file(f"dev_{ts}_{filename}", text.encode("utf-8"))
-            self.on_file_received(path, is_text=True)
-            last_text = text
-
-            # 标记已取
-            try:
-                data = json.dumps({"file": filename}).encode("utf-8")
-                mark = urllib.request.Request(
-                    f"{NAS_URL}/dev-ideas-done", data=data,
-                    headers={**ua, "Content-Type": "application/json"}, method="POST"
-                )
-                urllib.request.urlopen(mark, timeout=10)
-            except Exception as e:
-                _logger.warning(f"[dev_poller] 标记失败 {filename}: {e}")
-
-        # 只复制最后一条到剪贴板
-        if last_text:
-            set_clipboard_text(last_text)
-            _logger.info(f"[dev_poller] 拉取 {len(items)} 条开发想法")
 
     def _refresh_files(self):
         try:
