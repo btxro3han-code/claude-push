@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import com.flow.claudepush.ui.FileListScreen
 import com.flow.claudepush.ui.ImageViewScreen
 import com.flow.claudepush.ui.TextViewScreen
+import com.flow.claudepush.ui.VpsFilesScreen
 import com.flow.claudepush.ui.theme.ClaudePushTheme
 import org.json.JSONObject
 import java.io.File
@@ -34,7 +35,6 @@ import java.net.URL
 
 class MainActivity : ComponentActivity() {
     companion object {
-        private const val MAC_NOT_FOUND_MSG = "Mac未发现，请先用/push从Mac推一个文件过来"
     }
 
     private lateinit var repo: FileRepository
@@ -179,6 +179,7 @@ class MainActivity : ComponentActivity() {
         val hasWifi = remember(netTrigger) { PushService.getWifiNetwork() != null || PushService.getHotspotIp() != null }
         var isRunning by remember { mutableStateOf(true) }
         var viewingFile by remember { mutableStateOf<Pair<File, String>?>(null) }
+        var showVpsFiles by remember { mutableStateOf(false) }
 
         // Poll Mac connection status
         var macConnected by remember { mutableStateOf(false) }
@@ -187,6 +188,11 @@ class MainActivity : ComponentActivity() {
                 macConnected = PushService.macHost != null
                 kotlinx.coroutines.delay(2000)
             }
+        }
+
+        if (showVpsFiles) {
+            VpsFilesScreen(onBack = { showVpsFiles = false })
+            return
         }
 
         val current = viewingFile
@@ -256,7 +262,8 @@ class MainActivity : ComponentActivity() {
                     withMac { _, _ -> filePicker.launch("*/*") }
                 },
                 onSendClipboard = { sendClipboardToMac() },
-                onSendScreenshot = { requestScreenshotSend() }
+                onSendScreenshot = { requestScreenshotSend() },
+                onVpsFiles = { showVpsFiles = true }
             )
         }
     }
@@ -267,35 +274,65 @@ class MainActivity : ComponentActivity() {
 
     // ── Mac host resolution ──────────────────────────────────
 
-    private fun getMacHost(): String? {
+    /** Get LAN Mac host (may be null if not discovered). */
+    private fun getLanMacHost(): String? {
         return PushService.macHost
             ?: getSharedPreferences("claude_push", MODE_PRIVATE).getString("mac_host", null)
     }
 
-    private fun getMacPort(): Int {
+    private fun getLanMacPort(): Int {
         return if (PushService.macHost != null) PushService.macPort
             else getSharedPreferences("claude_push", MODE_PRIVATE).getInt("mac_port", 18081)
     }
 
-    /** Run block with Mac host/port, or show toast if Mac not found. */
+    /**
+     * Get the best Mac host/port: LAN first, VPS fallback.
+     * Returns Pair(host, port) or null if neither is available.
+     */
+    private fun getMacHost(): String? = getLanMacHost() ?: NsdHelper.VPS_HOST
+
+    private fun getMacPort(): Int {
+        return if (getLanMacHost() != null) getLanMacPort() else NsdHelper.VPS_PORT
+    }
+
+    /** Run block with Mac host/port. LAN first, VPS fallback. */
     private inline fun withMac(block: (host: String, port: Int) -> Unit) {
-        val host = getMacHost()
-        if (host == null) {
-            Toast.makeText(this, MAC_NOT_FOUND_MSG, Toast.LENGTH_LONG).show()
-            return
+        val lanHost = getLanMacHost()
+        if (lanHost != null) {
+            block(lanHost, getLanMacPort())
+        } else {
+            // No LAN Mac — use VPS relay
+            block(NsdHelper.VPS_HOST, NsdHelper.VPS_PORT)
         }
-        block(host, getMacPort())
     }
 
     // ── Upload to Mac ───────────────────────────────────────
 
     private fun uploadToMac(uri: Uri) = withMac { host, port ->
-        Toast.makeText(this, "正在发送到 $host:$port ...", Toast.LENGTH_SHORT).show()
+        val isLan = host != NsdHelper.VPS_HOST
+        val label = if (isLan) "LAN $host:$port" else "VPS中转"
+        Toast.makeText(this, "正在发送到 $label ...", Toast.LENGTH_SHORT).show()
         MacUploader.upload(this, uri, host, port) { ok, msg ->
-            runOnUiThread {
-                if (ok) {
+            if (ok) {
+                runOnUiThread {
                     Toast.makeText(this, "已发送: $msg", Toast.LENGTH_SHORT).show()
-                } else {
+                }
+            } else if (isLan) {
+                // LAN failed — retry via VPS relay
+                runOnUiThread {
+                    Toast.makeText(this, "LAN失败，尝试VPS中转...", Toast.LENGTH_SHORT).show()
+                }
+                MacUploader.upload(this, uri, NsdHelper.VPS_HOST, NsdHelper.VPS_PORT) { ok2, msg2 ->
+                    runOnUiThread {
+                        if (ok2) {
+                            Toast.makeText(this, "已通过VPS发送: $msg2", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(this, "发送失败: $msg2", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            } else {
+                runOnUiThread {
                     Toast.makeText(this, "发送失败: $msg", Toast.LENGTH_LONG).show()
                 }
             }
@@ -317,35 +354,56 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        val isLan = host != NsdHelper.VPS_HOST
         Toast.makeText(this, "正在发送剪贴板到Mac...", Toast.LENGTH_SHORT).show()
 
         Thread {
-            try {
-                val json = JSONObject().put("text", text)
-                val url = URL("http://$host:$port/clipboard")
-                val conn = url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.doOutput = true
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.connectTimeout = 5000
-                conn.readTimeout = 5000
-                conn.outputStream.use { it.write(json.toString().toByteArray()) }
-                val code = conn.responseCode
-                conn.disconnect()
+            val success = sendClipboardHttp(text, host, port)
+            if (!success && isLan) {
+                // LAN failed — retry via VPS
                 runOnUiThread {
-                    if (code == 200) {
+                    Toast.makeText(this, "LAN失败，尝试VPS中转...", Toast.LENGTH_SHORT).show()
+                }
+                val vpsSuccess = sendClipboardHttp(text, NsdHelper.VPS_HOST, NsdHelper.VPS_PORT)
+                runOnUiThread {
+                    if (vpsSuccess) {
+                        val preview = if (text.length > 30) text.take(30) + "..." else text
+                        Toast.makeText(this, "已通过VPS发送到Mac剪贴板: $preview", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "发送失败（LAN和VPS均不可达）", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } else {
+                runOnUiThread {
+                    if (success) {
                         val preview = if (text.length > 30) text.take(30) + "..." else text
                         Toast.makeText(this, "已发送到Mac剪贴板: $preview", Toast.LENGTH_SHORT).show()
                     } else {
-                        Toast.makeText(this, "发送失败: HTTP $code", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "发送失败", Toast.LENGTH_LONG).show()
                     }
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    Toast.makeText(this, "发送失败: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }.start()
+    }
+
+    /** Send clipboard text to a specific host:port. Returns true on success. */
+    private fun sendClipboardHttp(text: String, host: String, port: Int): Boolean {
+        return try {
+            val json = JSONObject().put("text", text)
+            val url = URL("http://$host:$port/clipboard")
+            val conn = url.openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            conn.outputStream.use { it.write(json.toString().toByteArray()) }
+            val code = conn.responseCode
+            conn.disconnect()
+            code == 200
+        } catch (_: Exception) {
+            false
+        }
     }
 
     // ── Screenshot to Mac ───────────────────────────────────
@@ -367,17 +425,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendLatestScreenshot() {
-        // Query MediaStore for latest screenshot
-        val uri = findLatestScreenshot()
-        if (uri == null) {
-            Toast.makeText(this, "未找到截图", Toast.LENGTH_SHORT).show()
+        // Query MediaStore for screenshots taken within the last minute
+        val uris = findRecentScreenshots()
+        if (uris.isEmpty()) {
+            Toast.makeText(this, "一分钟内没有截图", Toast.LENGTH_SHORT).show()
             return
         }
-        Toast.makeText(this, "正在发送最新截图到Mac...", Toast.LENGTH_SHORT).show()
-        uploadToMac(uri)
+        Toast.makeText(this, "正在发送 ${uris.size} 张截图到Mac...", Toast.LENGTH_SHORT).show()
+        for (uri in uris) {
+            uploadToMac(uri)
+        }
     }
 
-    private fun findLatestScreenshot(): Uri? {
+    private fun findRecentScreenshots(): List<Uri> {
         val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
         } else {
@@ -391,24 +451,27 @@ class MainActivity : ComponentActivity() {
             MediaStore.Images.Media.RELATIVE_PATH
         )
 
-        // Look for screenshots - common paths on different phones
-        val selection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
+        // Look for screenshots taken within the last 60 seconds
+        val cutoff = System.currentTimeMillis() / 1000 - 60
+        val pathFilter = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            "(${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?)"
         } else {
-            "${MediaStore.Images.Media.DATA} LIKE ? OR ${MediaStore.Images.Media.DATA} LIKE ?"
+            "(${MediaStore.Images.Media.DATA} LIKE ? OR ${MediaStore.Images.Media.DATA} LIKE ?)"
         }
-        val selectionArgs = arrayOf("%Screenshot%", "%screenshot%")
+        val selection = "$pathFilter AND ${MediaStore.Images.Media.DATE_ADDED} >= ?"
+        val selectionArgs = arrayOf("%Screenshot%", "%screenshot%", cutoff.toString())
 
         val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
 
+        val results = mutableListOf<Uri>()
         contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
-                return Uri.withAppendedPath(collection, id.toString())
+                results.add(Uri.withAppendedPath(collection, id.toString()))
             }
         }
-        return null
+        return results
     }
 
     // ── Share Intent ────────────────────────────────────────

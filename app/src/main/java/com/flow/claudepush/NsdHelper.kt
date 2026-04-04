@@ -137,5 +137,9 @@ class NsdHelper(private val context: Context) {
         private const val TAG = "NsdHelper"
         /** Mac receiver port — must match PORT in claude_push_mac.py */
         const val MAC_PORT = 18081
+
+        /** VPS FRP relay — fallback when Mac is not on LAN */
+        const val VPS_HOST = "47.100.199.151"
+        const val VPS_PORT = 6002
     }
 }

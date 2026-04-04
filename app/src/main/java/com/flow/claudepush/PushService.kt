@@ -202,7 +202,7 @@ class PushService : Service() {
         val wifiName = getWifiName()
         val hotspotIp = getHotspotIp()
         val subtitle = if (ip == "0.0.0.0" && hotspotIp == null) {
-            "No WiFi — waiting for connection"
+            "VPS relay active | No WiFi"
         } else if (ip == "0.0.0.0" && hotspotIp != null) {
             "Hotspot mode | $hotspotIp:$SERVER_PORT"
         } else if (wifiName != null) {

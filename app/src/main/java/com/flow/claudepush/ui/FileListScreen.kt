@@ -4,7 +4,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
@@ -40,6 +39,7 @@ fun FileListScreen(
     onSendToMac: () -> Unit,
     onSendClipboard: () -> Unit,
     onSendScreenshot: () -> Unit,
+    onVpsFiles: () -> Unit = {},
 ) {
     var selectMode by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf(setOf<String>()) }
@@ -106,33 +106,24 @@ fun FileListScreen(
                 horizontalAlignment = Alignment.End,
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // Screenshot button
+                // Screenshot button (always enabled — VPS fallback available)
                 SmallFloatingActionButton(
                     onClick = onSendScreenshot,
-                    containerColor = if (macConnected)
-                        MaterialTheme.colorScheme.tertiary
-                    else
-                        MaterialTheme.colorScheme.surfaceVariant
+                    containerColor = MaterialTheme.colorScheme.tertiary
                 ) {
                     Text("📸")
                 }
                 // Clipboard button
                 SmallFloatingActionButton(
                     onClick = onSendClipboard,
-                    containerColor = if (macConnected)
-                        MaterialTheme.colorScheme.secondary
-                    else
-                        MaterialTheme.colorScheme.surfaceVariant
+                    containerColor = MaterialTheme.colorScheme.secondary
                 ) {
                     Text("📋")
                 }
                 // File picker button
                 FloatingActionButton(
                     onClick = onSendToMac,
-                    containerColor = if (macConnected)
-                        MaterialTheme.colorScheme.primary
-                    else
-                        MaterialTheme.colorScheme.surfaceVariant
+                    containerColor = MaterialTheme.colorScheme.primary
                 ) {
                     Text("⬆", style = MaterialTheme.typography.headlineMedium)
                 }
@@ -152,20 +143,7 @@ fun FileListScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     if (isRunning) {
-                        if (!hasWifi) {
-                            Text(
-                                "⚠️ 需要WiFi连接",
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.error
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                "请连接WiFi网络，仅蜂窝网络无法使用",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error
-                            )
-                        } else {
+                        if (hasWifi) {
                             if (wifiName != null) {
                                 Text(
                                     "📶 $wifiName",
@@ -178,16 +156,25 @@ fun FileListScreen(
                                 style = MaterialTheme.typography.headlineSmall,
                                 fontWeight = FontWeight.Bold
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
+                        } else {
                             Text(
-                                if (macConnected) "💻 Mac connected" else "💻 Searching for Mac...",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (macConnected)
-                                    MaterialTheme.colorScheme.primary
-                                else
-                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                "VPS中转模式",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.tertiary
                             )
                         }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            if (macConnected) "💻 Mac connected (LAN)"
+                            else if (hasWifi) "💻 VPS中转可用"
+                            else "💻 通过VPS中转连接Mac",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (macConnected)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.tertiary
+                        )
                     } else {
                         Text(
                             "Server stopped",
@@ -196,11 +183,22 @@ fun FileListScreen(
                         )
                     }
                     Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = onToggleServer,
-                        modifier = Modifier.fillMaxWidth()
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text(if (isRunning) "Stop Server" else "Start Server")
+                        Button(
+                            onClick = onToggleServer,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (isRunning) "Stop Server" else "Start Server")
+                        }
+                        OutlinedButton(
+                            onClick = onVpsFiles,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("VPS文件")
+                        }
                     }
                 }
             }
